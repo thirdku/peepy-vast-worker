@@ -25,6 +25,7 @@ import random
 import threading
 import time
 
+import aiohttp
 import requests
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
@@ -151,6 +152,26 @@ def workload_calculator(payload: dict) -> float:
     return cost
 
 
+# ── live progress passthrough ────────────────────────────────────────────────
+# Forge's /sdapi/v1/progress is GET-only, so a plain forwarding handler can't
+# front it (the pyworker forwards POST). A remote-dispatch handler runs this
+# coroutine instead of forwarding — it answers WHILE a render is in flight
+# because allow_parallel_requests=True bypasses the txt2img FIFO queue, and
+# the caller reuses the render's own auth_data (signatures aren't single-use).
+
+async def forge_progress() -> dict:
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(f"{FORGE_URL}/sdapi/v1/progress",
+                             params={"skip_current_image": "true"}) as r:
+                if r.status == 200:
+                    return await r.json()
+    except Exception:
+        pass
+    return {}
+
+
 # ── worker config ────────────────────────────────────────────────────────────
 
 worker_config = WorkerConfig(
@@ -168,6 +189,13 @@ worker_config = WorkerConfig(
                 concurrency=1,
                 runs=2,
             ),
+        ),
+        HandlerConfig(
+            route="/sdapi/v1/progress",
+            allow_parallel_requests=True,   # must answer during a render
+            max_queue_time=None,            # cosmetic polls never 429
+            workload_calculator=lambda payload: 0.0,  # zero autoscaler load
+            remote_function=forge_progress,
         ),
     ],
     log_action_config=LogActionConfig(
