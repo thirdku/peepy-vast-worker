@@ -220,6 +220,11 @@ cfg["enable_pnginfo"] = False
 # when enable_pnginfo is off — kill it too (golden box has the option key
 # present, so the feature exists in this build).
 cfg["stealth_pnginfo"] = False
+# ADetailer multi-face determinism: default bbox sort is "None" (arbitrary model
+# output order) — couple mode's [SEP] per-face prompts NEED left-to-right so the
+# segment order matches the Forge Couple region order. buildForgePayload also
+# sends this per-request via override_settings; this is the config-level default.
+cfg["ad_bbox_sortby"] = "Position (left to right)"
 json.dump(cfg, open(p, "w"), indent=2)
 print(f"[provision] patched {p}: enable_pnginfo=false stealth_pnginfo=false")
 EOF
