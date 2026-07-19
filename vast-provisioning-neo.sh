@@ -102,11 +102,14 @@ function provisioning_install_neo() {
         uv venv .venv --python 3.13
     fi
     # uv venvs have no pip; ADetailer-Neo's install.py shells out to `python -m pip`.
-    # Seed ONLY pip here — installing ultralytics via uv at this point resolves its
-    # own (newest) torch as a dependency, racing Neo's pinned torch cu130 which the
-    # warm boot installs. With pip present, ADetailer-Neo's install.py brings in its
-    # pinned ultralytics itself DURING the warm boot, after the right torch is in.
+    # Seed pip, then PIN torch cu130 into the venv OURSELVES: launch.py's --uv flow
+    # installed deps into an ephemeral env that didn't persist (and its GPU check
+    # then failed against the wrong torch — seen live on test box 45303289), so the
+    # fleet boots WITHOUT --uv and everything must already be, or get pip-installed,
+    # IN the venv. torch pinned to the version Neo's own resolver picked (Jul 2026).
     uv pip install --python .venv/bin/python pip
+    uv pip install --python .venv/bin/python "torch==2.11.0" "torchvision==0.26.0" \
+        --index-url https://download.pytorch.org/whl/cu130
 }
 
 # ── Extensions ───────────────────────────────────────────────────────────────
@@ -175,7 +178,7 @@ EOF
 function provisioning_warm_boot() {
     cd "$NEO_DIR"
     echo "[provision] warm boot (installs torch + deps, then killed)..."
-    PATH="$HOME/.local/bin:$PATH" setsid .venv/bin/python launch.py --uv --api --port "$NEO_PORT" \
+    PATH="$HOME/.local/bin:$PATH" setsid .venv/bin/python launch.py --api --port "$NEO_PORT" \
         > /tmp/neo-warmboot.log 2>&1 &
     local pid=$!
     for i in $(seq 1 240); do   # up to 20 min for torch download on slow pipes
@@ -207,7 +210,7 @@ while [ -f "/.provisioning" ]; do
 done
 cd "$NEO_DIR"
 export PATH="\$HOME/.local/bin:\$PATH"
-exec .venv/bin/python launch.py --uv --api --port ${NEO_PORT}
+exec .venv/bin/python launch.py --api --port ${NEO_PORT}
 NEOSH
     chmod +x /opt/supervisor-scripts/forge-neo.sh
 
