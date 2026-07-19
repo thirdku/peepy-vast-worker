@@ -51,6 +51,9 @@ NEO_PORT=${FORGE_INTERNAL_PORT:-17860}
 EXTENSIONS=(
     "https://github.com/Haoming02/ADetailer-Neo"
     "https://github.com/Haoming02/sd-forge-couple"
+    # Extra samplers (SA Solver / SA Solver PECE, SEEDS, Gradient Estimation, RES
+    # Multistep variants…) — reForge/Comfy samplers missing from Neo (owner, Jul 20).
+    "https://github.com/Panchovix/sd_forge_neo_extra_samplers"
 )
 
 ADETAILER_MODELS=(
