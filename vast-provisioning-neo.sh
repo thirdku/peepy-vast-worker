@@ -278,10 +278,13 @@ function provisioning_install_pyworker() {
         echo "[provision] PYWORKER_REPO not set — skipping pyworker service"
         return 0
     fi
-    if [[ -f /etc/supervisor/conf.d/pyworker.conf ]]; then
-        echo "[provision] image already ships a pyworker service — skipping"
-        return 0
-    fi
+    # ALWAYS install OUR bootstrap, even when the image ships a pyworker service:
+    # the stock one exits unless SERVERLESS=true is in the template env ("Skipping
+    # pyworker startup (not serverless)") — fleet workers then never report to the
+    # autoscaler and get destroyed at the loading deadline ("worker not found in
+    # webserver response", seen live Jul 19 2026, workers 45317341/45317342).
+    # Ours overwrites the same script path the stock conf runs, so whichever conf
+    # exists ends up running OUR bootstrap.
 
     cat > /opt/supervisor-scripts/pyworker.sh <<'PYW'
 #!/bin/bash
@@ -333,6 +336,7 @@ stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=1
 PYC
     supervisorctl reread && supervisorctl update
+    supervisorctl restart pyworker 2>/dev/null || true
     echo "[provision] pyworker supervisor service installed"
 }
 
