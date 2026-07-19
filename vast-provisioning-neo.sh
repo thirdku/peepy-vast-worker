@@ -98,8 +98,11 @@ function provisioning_install_neo() {
         uv venv .venv --python 3.13
     fi
     # uv venvs have no pip; ADetailer-Neo's install.py shells out to `python -m pip`.
-    # Pinned ultralytics matches the version its install.py requests.
-    uv pip install --python .venv/bin/python pip "ultralytics==8.3.253"
+    # Seed ONLY pip here — installing ultralytics via uv at this point resolves its
+    # own (newest) torch as a dependency, racing Neo's pinned torch cu130 which the
+    # warm boot installs. With pip present, ADetailer-Neo's install.py brings in its
+    # pinned ultralytics itself DURING the warm boot, after the right torch is in.
+    uv pip install --python .venv/bin/python pip
 }
 
 # ── Extensions ───────────────────────────────────────────────────────────────
