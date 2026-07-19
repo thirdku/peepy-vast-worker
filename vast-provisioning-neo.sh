@@ -69,8 +69,12 @@ function provisioning_start() {
     provisioning_sync_models
     provisioning_get_files "${NEO_DIR}/models/adetailer" "${ADETAILER_MODELS[@]}"
     provisioning_get_files "${NEO_DIR}/models/ESRGAN"    "${ESRGAN_MODELS[@]}"
-    provisioning_patch_forge_config
+    # Warm boot BEFORE the config patch: a config.json that exists before Neo's
+    # first launch trips verify_version() ("updating from an old version") which
+    # blocks on an interactive input() and EOFErrors headless. Neo stamps its own
+    # fresh config on first boot; we merge-patch our keys into it afterwards.
     provisioning_warm_boot
+    provisioning_patch_forge_config
 
     export GIT_CONFIG_GLOBAL=/tmp/temporary-git-config
     git config --file $GIT_CONFIG_GLOBAL --add safe.directory '*'
