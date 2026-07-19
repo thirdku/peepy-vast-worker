@@ -62,6 +62,19 @@ ESRGAN_MODELS=(
     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
 )
 
+# Anima stack fallbacks — public sources, fetched only when the R2 mirror didn't
+# deliver them (wget -nc skips existing files). Keeps provisioning independent of
+# the mirror's write-token situation; upload to R2 later and these become no-ops.
+ANIMA_TE_MODELS=(
+    "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors"
+)
+ANIMA_VAE_MODELS=(
+    "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors"
+)
+ANIMA_CKPT_MODELS=(
+    "https://civitai.com/api/download/models/3041842"   # homosimileAnima_v10.safetensors (content-disposition)
+)
+
 function provisioning_start() {
     provisioning_print_header
     provisioning_install_neo
@@ -69,6 +82,9 @@ function provisioning_start() {
     provisioning_sync_models
     provisioning_get_files "${NEO_DIR}/models/adetailer" "${ADETAILER_MODELS[@]}"
     provisioning_get_files "${NEO_DIR}/models/ESRGAN"    "${ESRGAN_MODELS[@]}"
+    provisioning_get_files "${NEO_DIR}/models/text_encoder"     "${ANIMA_TE_MODELS[@]}"
+    provisioning_get_files "${NEO_DIR}/models/VAE"              "${ANIMA_VAE_MODELS[@]}"
+    provisioning_get_files "${NEO_DIR}/models/Stable-diffusion" "${ANIMA_CKPT_MODELS[@]}"
     # Warm boot BEFORE the config patch: a config.json that exists before Neo's
     # first launch trips verify_version() ("updating from an old version") which
     # blocks on an interactive input() and EOFErrors headless. Neo stamps its own
