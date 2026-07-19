@@ -220,10 +220,19 @@ function provisioning_warm_boot() {
 function provisioning_install_forge_service() {
     cat > /opt/supervisor-scripts/forge-neo.sh <<NEOSH
 #!/bin/bash
+set -a; . /etc/environment 2>/dev/null; set +a
 while [ -f "/.provisioning" ]; do
     echo "forge-neo startup paused (provisioning)..."
     sleep 5
 done
+# Fresh-sync the small, hot-swappable model folders on EVERY boot (not just
+# provisioning): the owner drops new LoRAs/embeddings into R2 and every worker
+# picks them up at its next start — no manual per-worker syncs. rclone skips
+# unchanged files, so a no-change boot costs only a listing (~2s).
+if command -v rclone >/dev/null && [ -n "\$R2_BUCKET" ]; then
+    rclone copy "r2:\$R2_BUCKET/lora"       "$NEO_DIR/models/Lora"       --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/embeddings" "$NEO_DIR/models/embeddings" --transfers 4 -q || true
+fi
 cd "$NEO_DIR"
 export PATH="\$HOME/.local/bin:\$PATH"
 exec .venv/bin/python launch.py --api --port ${NEO_PORT}
