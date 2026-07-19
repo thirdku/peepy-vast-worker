@@ -32,7 +32,7 @@ from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, Benchma
 FORGE_PORT = int(os.environ.get("FORGE_INTERNAL_PORT", "17860"))
 FORGE_URL = f"http://127.0.0.1:{FORGE_PORT}"
 LOG_FILE = os.environ.get("MODEL_LOG_FILE", "/var/log/portal/forge.log")
-BENCHMARK_CHECKPOINT = os.environ.get("FORGE_MODEL", "AniCoreXL_illustriousV5.1")
+BENCHMARK_CHECKPOINT = os.environ.get("FORGE_MODEL", "homosimileXLPony_v40NAIXLEPS")
 # First boot loads a ~7GB checkpoint from disk after provisioning; be patient.
 STARTUP_TIMEOUT_S = int(os.environ.get("FORGE_STARTUP_TIMEOUT", "1800"))
 
@@ -48,12 +48,38 @@ def _append_log(line: str) -> None:
         f.write(line + "\n")
 
 
+def _probe_render() -> bool:
+    """Prove the API can serve PRODUCTION payloads, not just list models.
+
+    Forge Neo answers /sdapi before its extension script-arg tables settle —
+    any request carrying alwayson_scripts in that window 500s with
+    "list assignment index out of range" (seen live, Jul 19 2026). A tiny real
+    render with a disabled ADetailer block exercises exactly that table, and
+    doubles as the checkpoint pre-warm before the benchmark runs.
+    """
+    payload = {
+        "prompt": "1boy", "negative_prompt": "girl",
+        "steps": 1, "width": 256, "height": 320, "cfg_scale": 5,
+        "sampler_name": "Euler a", "seed": 1,
+        "send_images": False, "save_images": False,
+        "override_settings": {"sd_model_checkpoint": BENCHMARK_CHECKPOINT},
+        "override_settings_restore_afterwards": False,
+        # Disabled block: parses through the arg table without running detection.
+        "alwayson_scripts": {"ADetailer": {"args": [False, False, {"ad_model": "None"}]}},
+    }
+    try:
+        r = requests.post(f"{FORGE_URL}/sdapi/v1/txt2img", json=payload, timeout=300)
+        return r.ok
+    except Exception:
+        return False
+
+
 def _readiness_shim() -> None:
     deadline = time.time() + STARTUP_TIMEOUT_S
     while time.time() < deadline:
         try:
             r = requests.get(f"{FORGE_URL}/sdapi/v1/sd-models", timeout=5)
-            if r.ok and isinstance(r.json(), list) and len(r.json()) > 0:
+            if r.ok and isinstance(r.json(), list) and len(r.json()) > 0 and _probe_render():
                 _append_log(READY_TOKEN)
                 return
         except Exception:
