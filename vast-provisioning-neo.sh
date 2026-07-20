@@ -159,6 +159,10 @@ function provisioning_sync_models() {
     sync_pair "embeddings"    "${NEO_DIR}/models/embeddings"
     sync_pair "text_encoders" "${NEO_DIR}/models/text_encoder"
     sync_pair "vae"           "${NEO_DIR}/models/VAE"
+    # Fully mirrored since Jul 20 2026: the upscaler + detector weights too, so a
+    # provision succeeds with ONLY R2 up (the wget fallbacks below no-op via -nc).
+    sync_pair "esrgan"        "${NEO_DIR}/models/ESRGAN"
+    sync_pair "adetailer"     "${NEO_DIR}/models/adetailer"
 }
 
 function sync_pair() {
