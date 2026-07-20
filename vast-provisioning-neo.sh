@@ -232,13 +232,18 @@ while [ -f "/.provisioning" ]; do
     echo "forge-neo startup paused (provisioning)..."
     sleep 5
 done
-# Fresh-sync the small, hot-swappable model folders on EVERY boot (not just
-# provisioning): the owner drops new LoRAs/embeddings into R2 and every worker
-# picks them up at its next start — no manual per-worker syncs. rclone skips
-# unchanged files, so a no-change boot costs only a listing (~2s).
+# Fresh-sync ALL model folders from R2 on EVERY boot (not just provisioning):
+# the owner drops new checkpoints/LoRAs/etc into the mirror and every worker
+# picks them up at its next start — no manual per-worker syncs, no reprovision.
+# rclone skips unchanged files, so a no-change boot costs only listings (~5s).
 if command -v rclone >/dev/null && [ -n "\$R2_BUCKET" ]; then
-    rclone copy "r2:\$R2_BUCKET/lora"       "$NEO_DIR/models/Lora"       --transfers 4 -q || true
-    rclone copy "r2:\$R2_BUCKET/embeddings" "$NEO_DIR/models/embeddings" --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/checkpoints"   "$NEO_DIR/models/Stable-diffusion" --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/lora"          "$NEO_DIR/models/Lora"             --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/embeddings"    "$NEO_DIR/models/embeddings"       --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/text_encoders" "$NEO_DIR/models/text_encoder"     --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/vae"           "$NEO_DIR/models/VAE"              --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/esrgan"        "$NEO_DIR/models/ESRGAN"           --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/adetailer"     "$NEO_DIR/models/adetailer"        --transfers 4 -q || true
 fi
 cd "$NEO_DIR"
 export PATH="\$HOME/.local/bin:\$PATH"
