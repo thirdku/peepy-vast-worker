@@ -114,6 +114,14 @@ function provisioning_install_neo() {
     if [[ ! -d "$NEO_DIR" ]]; then
         git clone --branch neo https://github.com/Haoming02/sd-webui-forge-classic "$NEO_DIR"
     fi
+    # PIN (Jul 22 2026): the fleet used to ride Neo's moving HEAD and inherited
+    # upstream regressions within HOURS of each push (fleet-wide CUDA
+    # illegal-address outage — workers were running a commit pushed the same
+    # morning). 025bbdda = the Jul 19 golden-box-validated cutover commit.
+    # Roll forward ONLY by canarying a new SHA on a disposable box first,
+    # then editing this line. Never un-pin.
+    git -C "$NEO_DIR" checkout --quiet 025bbdda \
+        || echo "[provision] WARN: Neo pin checkout FAILED — running branch HEAD (unvalidated!)"
     mkdir -p "$NEO_DIR/tmp"   # missing tmp = gradio init crash = corrupted API arg table
 
     cd "$NEO_DIR"
