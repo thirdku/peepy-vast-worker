@@ -48,12 +48,18 @@ source /venv/main/bin/activate 2>/dev/null || true
 NEO_DIR=${WORKSPACE:-/workspace}/sd-webui-forge-neo
 NEO_PORT=${FORGE_INTERNAL_PORT:-17860}
 
+# PINNED to the exact SHAs the fleet was proven-clean on (Jul 23 2026). The whole
+# neo incident was riding upstream HEAD — these three extensions are moving targets
+# too, so freeze them. `repo@sha`; checkout happens in provisioning_get_extensions.
+# ls-remote confirmed each SHA == current HEAD (dormant repos), so this changes
+# nothing today and guards against a FUTURE upstream regression. Roll forward only
+# by canarying a new SHA on a disposable box, then bumping the pin here.
 EXTENSIONS=(
-    "https://github.com/Haoming02/ADetailer-Neo"
-    "https://github.com/Haoming02/sd-forge-couple"
+    "https://github.com/Haoming02/ADetailer-Neo@ac06b8a98505fae6ae43b03491fd6ca7ca983f81"
+    "https://github.com/Haoming02/sd-forge-couple@c7884e81623d7fcbf4c92e3aea14ced8b5b6aa74"
     # Extra samplers (SA Solver / SA Solver PECE, SEEDS, Gradient Estimation, RES
     # Multistep variants…) — reForge/Comfy samplers missing from Neo (owner, Jul 20).
-    "https://github.com/Panchovix/sd_forge_neo_extra_samplers"
+    "https://github.com/Panchovix/sd_forge_neo_extra_samplers@7e9e2bf4e4d8956e39004fcdc3845cb0e5bca257"
 )
 
 ADETAILER_MODELS=(
@@ -142,13 +148,19 @@ function provisioning_install_neo() {
 # ── Extensions ───────────────────────────────────────────────────────────────
 function provisioning_get_extensions() {
     mkdir -p "${NEO_DIR}/extensions"
-    for repo in "${EXTENSIONS[@]}"; do
+    for entry in "${EXTENSIONS[@]}"; do
+        repo="${entry%@*}"        # strip trailing @sha (GitHub https URLs have no other @)
+        sha="${entry##*@}"        # the pinned commit
         dir="${repo##*/}"
         path="${NEO_DIR}/extensions/${dir}"
         if [[ ! -d $path ]]; then
-            printf "Downloading extension: %s...\n" "${repo}"
+            printf "Downloading extension: %s @ %s...\n" "${repo}" "${sha}"
             git clone "${repo}" "${path}" --recursive
         fi
+        # Freeze to the pinned SHA + realign submodules to it. Never un-pin.
+        git -C "$path" checkout --quiet "$sha" \
+            && git -C "$path" submodule update --init --recursive --quiet \
+            || echo "[provision] WARN: extension pin ${dir}@${sha} FAILED — running HEAD (unvalidated!)"
     done
 }
 
