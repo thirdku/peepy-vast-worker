@@ -183,6 +183,13 @@ function provisioning_sync_models() {
     # provision succeeds with ONLY R2 up (the wget fallbacks below no-op via -nc).
     sync_pair "esrgan"        "${NEO_DIR}/models/ESRGAN"
     sync_pair "adetailer"     "${NEO_DIR}/models/adetailer"
+    # ControlNet (Jul 25 2026): the control MODELS (models/ControlNet — Forge scans
+    # this at startup, so it MUST be synced before launch.py) + the preprocessor
+    # ANNOTATOR weights (models/ControlNetPreprocessor — depth_anything_v2 + DWPose
+    # yolox/dw-ll, ~975MB) so depth/openpose work with NO HuggingFace dependency at
+    # render time. Union model handles both depth+openpose on the SDXL checkpoints.
+    sync_pair "controlnet"              "${NEO_DIR}/models/ControlNet"
+    sync_pair "controlnet_preprocessor" "${NEO_DIR}/models/ControlNetPreprocessor"
 }
 
 function sync_pair() {
@@ -264,6 +271,9 @@ if command -v rclone >/dev/null && [ -n "\$R2_BUCKET" ]; then
     rclone copy "r2:\$R2_BUCKET/vae"           "$NEO_DIR/models/VAE"              --transfers 4 -q || true
     rclone copy "r2:\$R2_BUCKET/esrgan"        "$NEO_DIR/models/ESRGAN"           --transfers 4 -q || true
     rclone copy "r2:\$R2_BUCKET/adetailer"     "$NEO_DIR/models/adetailer"        --transfers 4 -q || true
+    # ControlNet: control model (scanned at launch, so synced here BEFORE it) + preprocessor annotators
+    rclone copy "r2:\$R2_BUCKET/controlnet"              "$NEO_DIR/models/ControlNet"              --transfers 4 -q || true
+    rclone copy "r2:\$R2_BUCKET/controlnet_preprocessor" "$NEO_DIR/models/ControlNetPreprocessor" --transfers 4 -q || true
 fi
 cd "$NEO_DIR"
 export PATH="\$HOME/.local/bin:\$PATH"
