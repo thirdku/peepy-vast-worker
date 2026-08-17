@@ -60,6 +60,10 @@ EXTENSIONS=(
     # Extra samplers (SA Solver / SA Solver PECE, SEEDS, Gradient Estimation, RES
     # Multistep variants…) — reForge/Comfy samplers missing from Neo (owner, Jul 20).
     "https://github.com/Panchovix/sd_forge_neo_extra_samplers@7e9e2bf4e4d8956e39004fcdc3845cb0e5bca257"
+    # Extra samplers + schedulers incl. the CFG++ family ("Euler a CFG++" — the FurryMusk/
+    # AnthroGlaze/FurryGloss site styles ride it) and extra schedulers (owner, Aug 17).
+    # Pinned to HEAD @ Dec 5 2025 ("determinism (with sigma churn Setting)").
+    "https://github.com/DenOfEquity/webUI_ExtraSchedulers@705c39ab6774c245d5ded5ff7213cba600320886"
 )
 
 ADETAILER_MODELS=(
