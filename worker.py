@@ -24,6 +24,7 @@ import os
 import random
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiohttp
 import requests
@@ -38,6 +39,60 @@ STARTUP_TIMEOUT_S = int(os.environ.get("FORGE_STARTUP_TIMEOUT", "1800"))
 
 READY_TOKEN = "FORGE_READY"
 FAIL_TOKEN = "FORGE_START_FAILED"
+
+# ── health (Sep 2 2026) ───────────────────────────────────────────────────────
+# The framework's readiness used to be "an on_load token appeared in the log" + a cached
+# benchmark. The log was never rotated, so every RESTART re-read a stale FORGE_READY from
+# a previous boot and the worker advertised itself ready ~8s after boot while Forge was
+# still 15-30s from serving (empty 500s / 404s / hang-ups for every render routed in that
+# window — and a worker whose Forge could not start at all, e.g. a host with a broken GPU
+# driver, sat "ready" forever and black-holed the queue). Two fixes:
+#   • the template now sets ROTATE_MODEL_LOG=true (start_server.sh truncates the log per
+#     start) so on_load can only fire from THIS boot's probe render;
+#   • model_healthcheck_url below: the framework will not mark the model loaded until this
+#     endpoint answers 200, and marks the worker ERRORED if it later stops answering — so
+#     a dead Forge takes the worker out of routing instead of eating renders.
+# /health = 200 only when (a) this boot's probe render has passed and (b) Forge's API has
+# answered within the last LIVENESS_GRACE_S. The grace window rides out supervisor
+# restarting Forge after a crash (~15s) without convicting a worker that will recover.
+HEALTH_PORT = int(os.environ.get("FORGE_HEALTH_PORT", "17870"))
+LIVENESS_GRACE_S = int(os.environ.get("FORGE_LIVENESS_GRACE_S", "90"))
+_probe_passed = False
+_last_forge_ok = 0.0
+
+
+def _liveness_loop() -> None:
+    global _last_forge_ok
+    while True:
+        try:
+            r = requests.get(f"{FORGE_URL}/sdapi/v1/progress", params={"skip_current_image": "true"}, timeout=5)
+            if r.ok:
+                _last_forge_ok = time.time()
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 — http.server API
+        alive = _probe_passed and (time.time() - _last_forge_ok) < LIVENESS_GRACE_S
+        body = b"ok" if alive else b"not ready"
+        self.send_response(200 if alive else 503)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args) -> None:  # keep the pyworker log clean (polled every 10s)
+        return
+
+
+def _serve_health() -> None:
+    HTTPServer(("127.0.0.1", HEALTH_PORT), _HealthHandler).serve_forever()
+
+
+threading.Thread(target=_liveness_loop, daemon=True).start()
+threading.Thread(target=_serve_health, daemon=True).start()
 
 
 # ── readiness shim ───────────────────────────────────────────────────────────
@@ -75,11 +130,13 @@ def _probe_render() -> bool:
 
 
 def _readiness_shim() -> None:
+    global _probe_passed
     deadline = time.time() + STARTUP_TIMEOUT_S
     while time.time() < deadline:
         try:
             r = requests.get(f"{FORGE_URL}/sdapi/v1/sd-models", timeout=5)
             if r.ok and isinstance(r.json(), list) and len(r.json()) > 0 and _probe_render():
+                _probe_passed = True  # /health may now answer 200 (liveness permitting)
                 _append_log(READY_TOKEN)
                 return
         except Exception:
@@ -204,6 +261,10 @@ worker_config = WorkerConfig(
     model_server_url="http://127.0.0.1",
     model_server_port=FORGE_PORT,
     model_log_file=LOG_FILE,
+    # Readiness + liveness gate (see the health block above): the framework polls this every
+    # 10s, needs one 200 before marking the model loaded, and errors the worker on a later
+    # non-200 — a Forge that dies is taken out of routing instead of 500ing every render.
+    model_healthcheck_url=f"http://127.0.0.1:{HEALTH_PORT}/health",
     handlers=[
         HandlerConfig(
             route="/sdapi/v1/txt2img",
