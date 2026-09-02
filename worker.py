@@ -55,6 +55,34 @@ FAIL_TOKEN = "FORGE_START_FAILED"
 # /health = 200 only when (a) this boot's probe render has passed and (b) Forge's API has
 # answered within the last LIVENESS_GRACE_S. The grace window rides out supervisor
 # restarting Forge after a crash (~15s) without convicting a worker that will recover.
+# Rotate the model log OURSELVES at import time (Sep 2 2026). Vast's start_server.sh only
+# rotates when the template sets ROTATE_MODEL_LOG=true + MODEL_LOG, and the account API key
+# can't edit templates — so do the equivalent here, BEFORE the framework opens the file: the
+# tailer reads from the START of the file, so any FORGE_READY left by a previous boot would be
+# consumed as "loaded" ~8s after boot. This runs at module import, ahead of the readiness thread
+# and ahead of Worker().run(), so the framework can only ever see THIS boot's token.
+def _rotate_model_log() -> None:
+    try:
+        if not os.path.isfile(LOG_FILE):
+            return
+        old = LOG_FILE + ".old"
+        with open(LOG_FILE, "rb") as src, open(old, "ab") as dst:
+            dst.write(src.read())
+        with open(LOG_FILE, "r+b") as f:
+            f.truncate(0)
+        # keep .old bounded (~20 MB) — supervisor's own 10 MB×1 rotation only covers the live file
+        if os.path.getsize(old) > 20 * 1024 * 1024:
+            with open(old, "rb") as f:
+                f.seek(-10 * 1024 * 1024, os.SEEK_END)
+                tail = f.read()
+            with open(old, "wb") as f:
+                f.write(tail)
+    except Exception:
+        pass  # a failed rotation just means the old behaviour (healthcheck still gates readiness)
+
+
+_rotate_model_log()
+
 HEALTH_PORT = int(os.environ.get("FORGE_HEALTH_PORT", "17870"))
 LIVENESS_GRACE_S = int(os.environ.get("FORGE_LIVENESS_GRACE_S", "90"))
 _probe_passed = False
