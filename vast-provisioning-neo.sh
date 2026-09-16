@@ -109,6 +109,7 @@ function provisioning_start() {
     git config --file $GIT_CONFIG_GLOBAL --add safe.directory '*'
 
     provisioning_install_forge_service
+    provisioning_install_model_sync
     provisioning_verify
     provisioning_install_pyworker
     provisioning_print_end
@@ -303,6 +304,72 @@ stdout_logfile_backups=1
 NEOC
     supervisorctl reread && supervisorctl update
     echo "[provision] forge-neo supervisor service installed (port ${NEO_PORT} → /var/log/portal/forge.log)"
+}
+
+# ── Periodic R2 model re-sync (Sep 2026) ─────────────────────────────────────
+# forge-neo.sh syncs the R2 mirror only at (re)start. A permanently-hot pool
+# (peepy-anima: cold=max=1) rarely reboots, so new checkpoints/LoRAs dropped in
+# the mirror would never reach it. This supervisor loop pulls the mirror on an
+# interval and hot-reloads Forge's checkpoint/LoRA lists (no restart needed).
+# GATED: idles unless MODEL_SYNC_INTERVAL_MIN > 0 — the SDXL fleet leaves it
+# unset (its churn already re-syncs at boot), so this is a no-op there. Set the
+# env (template env / /etc/environment) only for the endpoints that need it.
+function provisioning_install_model_sync() {
+    cat > /opt/supervisor-scripts/model-sync.sh <<'MSYNC'
+#!/bin/bash
+set -a; . /etc/environment 2>/dev/null; set +a
+NEO_DIR="${WORKSPACE:-/workspace}/sd-webui-forge-neo"
+PORT="${FORGE_INTERNAL_PORT:-17860}"
+INTERVAL_MIN="${MODEL_SYNC_INTERVAL_MIN:-0}"
+if ! [[ "$INTERVAL_MIN" =~ ^[0-9]+$ ]] || [ "$INTERVAL_MIN" -le 0 ]; then
+    echo "[model-sync] disabled (MODEL_SYNC_INTERVAL_MIN='${INTERVAL_MIN}') — idling"
+    exec sleep infinity
+fi
+if ! command -v rclone >/dev/null || [ -z "$R2_BUCKET" ]; then
+    echo "[model-sync] rclone or R2_BUCKET missing — idling"; exec sleep infinity
+fi
+sync_one() {  # $1 r2 subdir, $2 local dir -> stdout 'changed' when files moved
+    local out
+    out="$(rclone copy "r2:$R2_BUCKET/$1" "$2" --transfers 4 --log-level INFO 2>&1)"
+    echo "$out" | grep -qE 'Copied|Updated' && echo changed
+}
+while [ -f /.provisioning ]; do sleep 5; done
+echo "[model-sync] active — every ${INTERVAL_MIN}min from r2:${R2_BUCKET} (Forge :${PORT})"
+while true; do
+    sleep $((INTERVAL_MIN*60))
+    ck=""; lo=""
+    [ -n "$(sync_one checkpoints "$NEO_DIR/models/Stable-diffusion")" ] && ck=1
+    [ -n "$(sync_one lora        "$NEO_DIR/models/Lora")" ]            && lo=1
+    sync_one embeddings    "$NEO_DIR/models/embeddings"   >/dev/null
+    sync_one text_encoders "$NEO_DIR/models/text_encoder" >/dev/null
+    sync_one vae           "$NEO_DIR/models/VAE"          >/dev/null
+    sync_one esrgan        "$NEO_DIR/models/ESRGAN"       >/dev/null
+    sync_one adetailer     "$NEO_DIR/models/adetailer"    >/dev/null
+    if [ -n "$ck" ]; then
+        echo "[model-sync] checkpoint change -> refresh-checkpoints"
+        curl -s -m 30 -X POST "http://127.0.0.1:${PORT}/sdapi/v1/refresh-checkpoints" -o /dev/null || true
+    fi
+    if [ -n "$lo" ]; then
+        echo "[model-sync] LoRA change -> refresh-loras"
+        curl -s -m 30 -X POST "http://127.0.0.1:${PORT}/sdapi/v1/refresh-loras" -o /dev/null || true
+    fi
+done
+MSYNC
+    chmod +x /opt/supervisor-scripts/model-sync.sh
+    cat > /etc/supervisor/conf.d/model-sync.conf <<'MCONF'
+[program:model-sync]
+environment=PROC_NAME="%(program_name)s"
+command=/opt/supervisor-scripts/model-sync.sh
+autostart=true
+autorestart=true
+startsecs=5
+stdout_logfile=/var/log/portal/model-sync.log
+redirect_stderr=true
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=1
+MCONF
+    supervisorctl reread && supervisorctl update
+    echo "[provision] model-sync supervisor service installed (gated on MODEL_SYNC_INTERVAL_MIN)"
 }
 
 # ── Verify: a worker missing pieces must DIE here, loudly ────────────────────
