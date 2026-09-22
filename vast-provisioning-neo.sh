@@ -88,6 +88,35 @@ ANIMA_CKPT_MODELS=(
     "https://civitai.com/api/download/models/3041842"   # homosimileAnima_v10.safetensors (content-disposition)
 )
 
+# ── ComfyUI sidecar (Sep 22 2026) ────────────────────────────────────────────
+# The anima worker's PRIMARY render backend now: every Anima-arch style renders
+# through ComfyUI (peepy's /comfy/render remote-dispatch handler in worker.py),
+# Forge keeps SDXL + the couple-mode fallthrough. Models are SHARED — ComfyUI
+# reads Forge's model dirs via extra_model_paths.yaml, so the R2 sync above is
+# the only model sync. Everything pinned to the SHAs proven live on worker
+# 51615352 (Sep 22 2026); roll forward only by canarying, same rule as Neo.
+COMFY_DIR=${WORKSPACE:-/workspace}/ComfyUI
+COMFY_VENV=${WORKSPACE:-/workspace}/comfy-venv
+COMFY_PORT=${COMFY_INTERNAL_PORT:-8188}
+COMFY_PIN=b16023b004d3b1bfbbd6463414dc20da1b36cc4d    # ComfyUI v0.37.0-era, proven Sep 22 2026
+
+# `repo@sha` (cloned under the repo's basename) or `repo@sha|dirname`.
+COMFY_NODES=(
+    # AnimaBoosterLoader + AnimaTeaCache (the site styles' loader + step cache)
+    "https://github.com/BlackSnowSkill/ANIMA_BOOSTER@0cb1f45f4c6b8a726150faf9c08988bc10baf36c"
+    # AnimaArtistPack/CrossAttn/Options — dir renamed to the Comfy-registry id
+    "https://github.com/An1X3R/Anima-Artist-Mixer@0cc9ab7e8db906ee7cc200e771143c546e61f3af|anima-artist-mixer"
+    # FaceDetailer (the ADetailer-parity face pass) + its Ultralytics detector
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack@429d0159ad429e64d2b3916e6e7be9c22d025c3c"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack@50c7b71a6a224734cc9b21963c6d1926816a97f1"
+    # ClownsharKSampler (HunkyMix v2) + registers beta57 into the core schedulers
+    "https://github.com/ClownsharkBatwing/RES4LYF@056bc24a0450f5d46053535988cea4c719554806"
+    # DepthAnythingV2 preprocessor (Perfect Copy's depth_anything_v2 module)
+    "https://github.com/Fannovel16/comfyui_controlnet_aux@59b1fc411ede8623b2997855b8018f0b3b6cf49f"
+    # kohya's Anima ControlNet-LLLite apply node (reads Forge's ControlNet dir)
+    "https://github.com/kohya-ss/ComfyUI-Anima-LLLite@b7495bd8eb876e334509976896702484ed19cdbb"
+)
+
 function provisioning_start() {
     provisioning_print_header
     provisioning_install_neo
@@ -110,6 +139,8 @@ function provisioning_start() {
 
     provisioning_install_forge_service
     provisioning_install_model_sync
+    provisioning_install_comfyui
+    provisioning_install_comfy_service
     provisioning_verify
     provisioning_install_pyworker
     provisioning_print_end
@@ -372,6 +403,99 @@ MCONF
     echo "[provision] model-sync supervisor service installed (gated on MODEL_SYNC_INTERVAL_MIN)"
 }
 
+# ── ComfyUI sidecar install (Sep 22 2026) ────────────────────────────────────
+function provisioning_install_comfyui() {
+    if [[ ! -d "$COMFY_DIR" ]]; then
+        git clone https://github.com/comfyanonymous/ComfyUI "$COMFY_DIR"
+    fi
+    git -C "$COMFY_DIR" checkout --quiet "$COMFY_PIN" \
+        || echo "[provision] WARN: ComfyUI pin checkout FAILED — running HEAD (unvalidated!)"
+
+    # Own venv layered on the Forge venv's python (--system-site-packages): pip
+    # resolves ComfyUI's deps venv-locally (incl. its own torch cu130) and the
+    # Forge env is NEVER written to. torch/vision/audio filtered from the
+    # requirements install so pip can't be tempted to touch the base pins.
+    if [[ ! -d "$COMFY_VENV" ]]; then
+        "$NEO_DIR/.venv/bin/python" -m venv --system-site-packages "$COMFY_VENV"
+    fi
+    grep -viE '^(torch|torchvision|torchaudio)([=<>~ ]|$)' "$COMFY_DIR/requirements.txt" > /tmp/comfy-req.txt
+    "$COMFY_VENV/bin/pip" install -q -r /tmp/comfy-req.txt
+
+    mkdir -p "$COMFY_DIR/custom_nodes"
+    local entry spec dir repo sha path
+    for entry in "${COMFY_NODES[@]}"; do
+        spec="${entry%%|*}"
+        repo="${spec%@*}"
+        sha="${spec##*@}"
+        if [[ "$entry" == *"|"* ]]; then dir="${entry##*|}"; else dir="${repo##*/}"; fi
+        path="$COMFY_DIR/custom_nodes/$dir"
+        if [[ ! -d "$path" ]]; then
+            printf "Downloading ComfyUI node pack: %s @ %s...\n" "$repo" "$sha"
+            git clone "$repo" "$path"
+        fi
+        git -C "$path" checkout --quiet "$sha" \
+            || echo "[provision] WARN: node pin ${dir}@${sha} FAILED — running HEAD (unvalidated!)"
+        if [[ -f "$path/requirements.txt" ]]; then
+            "$COMFY_VENV/bin/pip" install -q -r "$path/requirements.txt" || true
+        fi
+    done
+    "$COMFY_VENV/bin/pip" cache purge >/dev/null 2>&1 || true
+
+    # Model sharing — ComfyUI reads Forge's model dirs directly: one copy on
+    # disk, one R2 sync (forge-neo.sh's boot sync feeds both backends).
+    # ultralytics_bbox → models/adetailer gives FaceDetailer the SAME
+    # face_yolov8n.pt weights Forge's ADetailer uses.
+    cat > "$COMFY_DIR/extra_model_paths.yaml" <<EOF
+forge:
+  base_path: ${NEO_DIR}/models
+  checkpoints: Stable-diffusion
+  diffusion_models: Stable-diffusion
+  unet: Stable-diffusion
+  loras: Lora
+  vae: VAE
+  text_encoders: text_encoder
+  clip: text_encoder
+  embeddings: embeddings
+  upscale_models: ESRGAN
+  controlnet: ControlNet
+  ultralytics_bbox: adetailer
+  ultralytics: adetailer
+EOF
+
+    # Depth-Anything vitb prefetch (Perfect Copy's preprocessor) — best-effort;
+    # comfyui_controlnet_aux auto-downloads it on first use if this fails.
+    local da_dir="$COMFY_DIR/custom_nodes/comfyui_controlnet_aux/ckpts/depth-anything/Depth-Anything-V2-Base"
+    mkdir -p "$da_dir"
+    if [[ ! -f "$da_dir/depth_anything_v2_vitb.pth" ]]; then
+        wget -q -O "$da_dir/depth_anything_v2_vitb.pth" \
+            "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth" \
+            || rm -f "$da_dir/depth_anything_v2_vitb.pth"
+    fi
+    echo "[provision] ComfyUI installed at ${COMFY_DIR} (pin ${COMFY_PIN:0:8}, $(ls "$COMFY_DIR/custom_nodes" | wc -l) node dirs)"
+}
+
+function provisioning_install_comfy_service() {
+    cat > /etc/supervisor/conf.d/comfyui.conf <<COMFYC
+[program:comfyui]
+environment=PROC_NAME="%(program_name)s"
+command=${COMFY_VENV}/bin/python ${COMFY_DIR}/main.py --listen 127.0.0.1 --port ${COMFY_PORT} --disable-auto-launch
+directory=${COMFY_DIR}
+autostart=true
+autorestart=true
+startsecs=10
+stopasgroup=true
+killasgroup=true
+stopsignal=TERM
+stopwaitsecs=10
+stdout_logfile=${WORKSPACE:-/workspace}/comfy.log
+redirect_stderr=true
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=1
+COMFYC
+    supervisorctl reread && supervisorctl update
+    echo "[provision] comfyui supervisor service installed (127.0.0.1:${COMFY_PORT} → comfy.log)"
+}
+
 # ── Verify: a worker missing pieces must DIE here, loudly ────────────────────
 function provisioning_verify() {
     local ok=1
@@ -387,6 +511,14 @@ function provisioning_verify() {
     [[ -d "${NEO_DIR}/extensions/sd-forge-couple" ]] || { echo "[provision] FATAL: sd-forge-couple missing"; ok=0; }
     [[ -d "${NEO_DIR}/tmp" ]] || { echo "[provision] FATAL: tmp dir missing"; ok=0; }
     .venv/bin/python -c "import ultralytics" 2>/dev/null || { echo "[provision] FATAL: ultralytics not importable"; ok=0; }
+    # ComfyUI sidecar (the anima styles' primary backend — a worker without it
+    # would black-hole every anima render into /comfy/render errors)
+    [[ -f "${COMFY_DIR}/main.py" ]] || { echo "[provision] FATAL: ComfyUI missing"; ok=0; }
+    "${COMFY_VENV}/bin/python" -c "import torch, aiohttp" 2>/dev/null || { echo "[provision] FATAL: comfy venv broken"; ok=0; }
+    local nd
+    for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite; do
+        [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
+    done
     if [[ $ok -eq 0 ]]; then
         echo "[provision] VERIFICATION FAILED — worker is not usable"
         exit 1

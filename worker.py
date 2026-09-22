@@ -19,6 +19,7 @@ as an end-to-end canary: a worker whose models didn't provision correctly
 fails its benchmark and never receives traffic.
 """
 
+import asyncio
 import base64
 import os
 import random
@@ -32,6 +33,12 @@ from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, Benchma
 
 FORGE_PORT = int(os.environ.get("FORGE_INTERNAL_PORT", "17860"))
 FORGE_URL = f"http://127.0.0.1:{FORGE_PORT}"
+# ComfyUI sidecar (Sep 2026, Anima workers only): a second render backend on the
+# same box, sharing Forge's model files via extra_model_paths.yaml. Reached
+# through the /comfy/render handler below; absent/down ComfyUI just errors that
+# one route — Forge routes are untouched.
+COMFY_PORT = int(os.environ.get("COMFY_INTERNAL_PORT", "8188"))
+COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 LOG_FILE = os.environ.get("MODEL_LOG_FILE", "/var/log/portal/forge.log")
 BENCHMARK_CHECKPOINT = os.environ.get("FORGE_MODEL", "homosimileXLPony_v40NAIXLEPS")
 # First boot loads a ~7GB checkpoint from disk after provisioning; be patient.
@@ -283,6 +290,120 @@ async def forge_progress() -> dict:
     return {}
 
 
+# ── ComfyUI render (remote-dispatch) ─────────────────────────────────────────
+# The client sends {payload: {prompt: <API-format graph>, timeout_s}} and gets
+# back {result: {images: [b64, ...]}} — the same images-array shape as Forge's
+# txt2img response, so the peepy dispatcher (renderComfy in vast.ts) reuses its
+# parsing. Runs as a remote_function because ComfyUI's API is async (submit →
+# poll /history → fetch /view), not a single POST the forwarder could front.
+
+async def comfy_render(prompt: dict = None, timeout_s: float = 240.0, images: dict = None) -> dict:
+    if not isinstance(prompt, dict) or not prompt:
+        return {"error": "missing prompt graph"}
+    # Perfect Copy references: {filename: base64} written into ComfyUI's input dir
+    # so the graph's LoadImage nodes find them at validation time. basename() kills
+    # path traversal; files are removed after the render either way.
+    staged = []
+    if isinstance(images, dict):
+        input_dir = "/workspace/ComfyUI/input"
+        try:
+            for name, b64 in images.items():
+                if not isinstance(name, str) or not isinstance(b64, str):
+                    continue
+                path = os.path.join(input_dir, os.path.basename(name))
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                staged.append(path)
+        except Exception as ex:
+            for p in staged:
+                try: os.remove(p)
+                except Exception: pass
+            return {"error": f"comfy image staging failed: {ex}"}
+    try:
+        return await _comfy_render_inner(prompt, timeout_s)
+    finally:
+        for p in staged:
+            try: os.remove(p)
+            except Exception: pass
+
+
+async def _comfy_render_inner(prompt: dict, timeout_s: float) -> dict:
+    try:
+        t = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=t) as s:
+            async with s.post(f"{COMFY_URL}/prompt", json={"prompt": prompt}) as r:
+                sub = await r.json(content_type=None)
+                if r.status != 200:
+                    return {"error": f"comfy submit {r.status}", "detail": sub}
+    except Exception as ex:
+        return {"error": f"comfy unreachable: {ex}"}
+    pid = sub.get("prompt_id")
+    if not pid:
+        return {"error": "comfy returned no prompt_id", "detail": sub}
+    deadline = time.time() + float(timeout_s)
+    entry = None
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        try:
+            t = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=t) as s:
+                async with s.get(f"{COMFY_URL}/history/{pid}") as r:
+                    data = await r.json(content_type=None)
+        except Exception:
+            continue  # transient poll failure — the render is still running
+        e = (data or {}).get(pid)
+        if not e:
+            continue
+        status = e.get("status") or {}
+        if status.get("status_str") == "error":
+            # surface the failing node's message, not the whole history blob
+            msgs = [m for m in status.get("messages") or [] if m and m[0] == "execution_error"]
+            return {"error": "comfy execution failed", "detail": (msgs[-1][1] if msgs else status)}
+        if status.get("completed"):
+            entry = e
+            break
+    if entry is None:
+        return {"error": f"comfy timeout after {timeout_s}s"}
+    images = []
+    try:
+        t = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=t) as s:
+            for out in (entry.get("outputs") or {}).values():
+                for im in out.get("images") or []:
+                    if im.get("type") != "output":
+                        continue
+                    q = {"filename": im.get("filename", ""),
+                         "subfolder": im.get("subfolder", ""), "type": "output"}
+                    async with s.get(f"{COMFY_URL}/view", params=q) as r:
+                        if r.status == 200:
+                            images.append(base64.b64encode(await r.read()).decode())
+    except Exception as ex:
+        return {"error": f"comfy image fetch failed: {ex}"}
+    if not images:
+        return {"error": "comfy produced no output images"}
+    return {"images": images}
+
+
+def comfy_workload(payload: dict) -> float:
+    """Same units as workload_calculator (steps × megapixels) read out of the
+    graph's KSampler/EmptyLatentImage nodes, ×2 because Anima's DiT steps run
+    ~2× an SDXL step on the same GPU."""
+    try:
+        graph = payload.get("prompt") or {}
+        steps, w, h = 27.0, 832.0, 1216.0
+        for node in graph.values():
+            ct = node.get("class_type")
+            inp = node.get("inputs") or {}
+            if ct == "KSampler":
+                steps = float(inp.get("steps", steps))
+            elif ct == "EmptyLatentImage":
+                w = float(inp.get("width", w))
+                h = float(inp.get("height", h))
+        return steps * (w * h / 1e6) * 2.0
+    except Exception:
+        return 55.0  # ~an anima render's typical cost
+
+
 # ── worker config ────────────────────────────────────────────────────────────
 
 worker_config = WorkerConfig(
@@ -304,6 +425,13 @@ worker_config = WorkerConfig(
                 concurrency=1,
                 runs=2,
             ),
+        ),
+        HandlerConfig(
+            route="/comfy/render",
+            allow_parallel_requests=False,  # one render at a time on this backend
+            max_queue_time=120.0,
+            workload_calculator=comfy_workload,
+            remote_function=comfy_render,
         ),
         HandlerConfig(
             route="/sdapi/v1/progress",
