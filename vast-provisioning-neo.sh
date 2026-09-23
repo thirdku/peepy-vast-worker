@@ -447,6 +447,32 @@ function provisioning_install_comfyui() {
     done
     "$COMFY_VENV/bin/pip" cache purge >/dev/null 2>&1 || true
 
+    # comfyui-prompt-control fixup: upstream's Anima Attention Couple predates
+    # ComfyUI's Jul 17 2026 Cosmos attn2_patch calling convention (pe= kwarg +
+    # dict return) — the SDXL-style kv-inject patches crash if they run inside
+    # the couple wrapper, and the wrapper already does the whole coupling, so
+    # they are stripped there. Verified live Sep 23 2026 (workers c3686b7f/
+    # d990221f); drop this once upstream moves past 88af041d with its own fix.
+    local pcfile="$COMFY_DIR/custom_nodes/comfyui-prompt-control/prompt_control/anima_couple.py"
+    if [[ -f "$pcfile" ]] && ! grep -q "peepy patch" "$pcfile"; then
+        python3 - "$pcfile" <<'PCPATCH' || echo "[provision] WARN: prompt-control anima patch FAILED (couple renders will error)"
+import sys
+p = sys.argv[1]
+src = open(p).read()
+old = "    out = _forward(xs, cs, rope_emb, transformer_options)"
+new = (
+    "    # peepy patch: strip SDXL-style attn patches inside the couple wrapper\n"
+    "    to_pc = dict(transformer_options)\n"
+    '    to_pc["patches"] = {k_: v_ for k_, v_ in to_pc.get("patches", {}).items()\n'
+    '                       if k_ not in ("attn2_patch", "attn2_output_patch")}\n'
+    "    out = _forward(xs, cs, rope_emb, to_pc)"
+)
+assert src.count(old) == 1, "anima_couple.py target line not unique"
+open(p, "w").write(src.replace(old, new))
+print("[provision] comfyui-prompt-control anima_couple patched")
+PCPATCH
+    fi
+
     # Model sharing — ComfyUI reads Forge's model dirs directly: one copy on
     # disk, one R2 sync (forge-neo.sh's boot sync feeds both backends).
     # ultralytics_bbox → models/adetailer gives FaceDetailer the SAME
