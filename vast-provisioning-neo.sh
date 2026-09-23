@@ -115,6 +115,9 @@ COMFY_NODES=(
     "https://github.com/Fannovel16/comfyui_controlnet_aux@59b1fc411ede8623b2997855b8018f0b3b6cf49f"
     # kohya's Anima ControlNet-LLLite apply node (reads Forge's ControlNet dir)
     "https://github.com/kohya-ss/ComfyUI-Anima-LLLite@b7495bd8eb876e334509976896702484ed19cdbb"
+    # Attention regional conditioning for Anima's DiT (couple mode) - the true
+    # forge-couple analog (credits it); the archived laksjdjf attention-couple is UNet-only
+    "https://github.com/Sen-sou/Comfyui-Anima-Regional-Conditioning@099cf1fa052721394963418455d49f7087efaf6c"
 )
 
 function provisioning_start() {
@@ -516,7 +519,7 @@ function provisioning_verify() {
     [[ -f "${COMFY_DIR}/main.py" ]] || { echo "[provision] FATAL: ComfyUI missing"; ok=0; }
     "${COMFY_VENV}/bin/python" -c "import torch, aiohttp" 2>/dev/null || { echo "[provision] FATAL: comfy venv broken"; ok=0; }
     local nd
-    for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite; do
+    for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning; do
         [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
     done
     if [[ $ok -eq 0 ]]; then
