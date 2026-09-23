@@ -118,6 +118,9 @@ COMFY_NODES=(
     # Attention regional conditioning for Anima's DiT (couple mode) - the true
     # forge-couple analog (credits it); the archived laksjdjf attention-couple is UNet-only
     "https://github.com/Sen-sou/Comfyui-Anima-Regional-Conditioning@099cf1fa052721394963418455d49f7087efaf6c"
+    # prompt-control: PCTextEncode COUPLE syntax + PCAnimaAttnCouplePatch
+    # (pamparamm's Attention Couple ported to Anima) — the DEFAULT couple method
+    "https://github.com/asagi4/comfyui-prompt-control@88af041dce376c97441d2efe5479e27de4b52cd8"
 )
 
 function provisioning_start() {
@@ -519,7 +522,7 @@ function provisioning_verify() {
     [[ -f "${COMFY_DIR}/main.py" ]] || { echo "[provision] FATAL: ComfyUI missing"; ok=0; }
     "${COMFY_VENV}/bin/python" -c "import torch, aiohttp" 2>/dev/null || { echo "[provision] FATAL: comfy venv broken"; ok=0; }
     local nd
-    for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning; do
+    for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning comfyui-prompt-control; do
         [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
     done
     if [[ $ok -eq 0 ]]; then
