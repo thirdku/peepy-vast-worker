@@ -503,6 +503,20 @@ EOF
             "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth" \
             || rm -f "$da_dir/depth_anything_v2_vitb.pth"
     fi
+    # Lineart annotator prefetch (/create's upload hero): netG.pth = AnimeLineArtPreprocessor (the
+    # default, Sep 30 2026), sk_model / sk_model2 = LineArtPreprocessor (the "Realistic" retry, Oct 1 2026;
+    # it loads both at init). Best-effort too: without them the first hero render on a worker spends
+    # ~30 s downloading.
+    local la_dir="$COMFY_DIR/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators"
+    mkdir -p "$la_dir"
+    local la_f
+    for la_f in netG.pth sk_model.pth sk_model2.pth; do
+        if [[ ! -f "$la_dir/$la_f" ]]; then
+            wget -q -O "$la_dir/$la_f" \
+                "https://huggingface.co/lllyasviel/Annotators/resolve/main/$la_f" \
+                || rm -f "$la_dir/$la_f"
+        fi
+    done
     echo "[provision] ComfyUI installed at ${COMFY_DIR} (pin ${COMFY_PIN:0:8}, $(ls "$COMFY_DIR/custom_nodes" | wc -l) node dirs)"
 }
 
