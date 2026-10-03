@@ -2,7 +2,9 @@
 
 Branch `video` of this repo (Oct 2026). The peepy-anima endpoint's template sets
 PYWORKER_REF=video and provisions with vast-provisioning-video.sh from this branch;
-the image fleet runs branch `neo` and never loads this file.
+the image fleet runs branch `neo` and never loads this file. The model is MiniMax H3
+fl2va (int8 transformer, nvfp4 Qwen3-VL text encoder, 4-step turbo LoRA); it replaced
+Wan 2.2 I2V A14B in Oct 2026.
 
 How it differs from neo's worker.py:
   • No Forge. ComfyUI is the model server, so readiness, liveness and the benchmark
@@ -39,24 +41,26 @@ COMFY_PORT = int(os.environ.get("COMFY_INTERNAL_PORT", "8188"))
 COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 COMFY_DIR = os.environ.get("COMFY_DIR", "/workspace/ComfyUI")
 LOG_FILE = os.environ.get("MODEL_LOG_FILE", "/workspace/comfy.log")
-# A fresh worker loads ~37 GB of Wan weights on its first render; be patient.
+# A fresh worker stages ~38 GB of H3 weights on its first render; be patient.
 STARTUP_TIMEOUT_S = int(os.environ.get("VIDEO_STARTUP_TIMEOUT", "2400"))
 
 READY_TOKEN = "PEEPY_VIDEO_READY"
 FAIL_TOKEN = "PEEPY_VIDEO_START_FAILED"
 
-# The files vast-provisioning-video.sh installs under ComfyUI/models/.
-WAN_HIGH = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
-WAN_LOW = "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
-WAN_TE = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-WAN_VAE = "wan_2.1_vae.safetensors"
-LORA_HIGH = "Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_260412_rank_64_fp16.safetensors"
-LORA_LOW = "Wan_2_2_I2V_A14B_LOW_lightx2v_4step_lora_260412_rank_64_fp16.safetensors"
+# The files vast-provisioning-video.sh installs under ComfyUI/models/: MiniMax H3 from
+# Comfy-Org/MiniMax-H3 (revision e5eb578a), plus the yaoi LoRA from Civitai, which the
+# app adds at 0.8 to two-man clips.
+H3_UNET = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+H3_TE = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+H3_VAE = "minimax_h3_video_vae_int8_convrot.safetensors"
+H3_TURBO = "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
+H3_YAOI = "yaoi_h3_lora_000002500.safetensors"
+H3_NODE = "MiniMaxH3ImageToVideo"
 REQUIRED_MODELS = {
-    "UNETLoader": ("unet_name", [WAN_HIGH, WAN_LOW]),
-    "CLIPLoader": ("clip_name", [WAN_TE]),
-    "VAELoader": ("vae_name", [WAN_VAE]),
-    "LoraLoaderModelOnly": ("lora_name", [LORA_HIGH, LORA_LOW]),
+    "UNETLoader": ("unet_name", [H3_UNET]),
+    "CLIPLoader": ("clip_name", [H3_TE]),
+    "VAELoader": ("vae_name", [H3_VAE]),
+    "LoraLoaderModelOnly": ("lora_name", [H3_TURBO, H3_YAOI]),
 }
 
 
@@ -173,8 +177,9 @@ threading.Thread(target=_serve_health, daemon=True).start()
 
 
 # ── readiness shim ───────────────────────────────────────────────────────────
-# ComfyUI up + every Wan file visible to its loaders. The real proof — a rendered
-# clip — is the framework's benchmark, which runs right after READY_TOKEN.
+# ComfyUI up + every H3 file visible to its loaders + the H3 node registered. The real
+# proof — a rendered clip — is the framework's benchmark, which runs right after
+# READY_TOKEN.
 
 def _append_log(line: str) -> None:
     try:
@@ -185,17 +190,29 @@ def _append_log(line: str) -> None:
         pass
 
 
+def _combo_options(spec) -> list:
+    """The options of a combo input, in either shape this ComfyUI pin serves: the loaders'
+    legacy [["a", "b"], {...}] or the newer ["COMBO", {"options": ["a", "b"]}]."""
+    if isinstance(spec, list) and spec:
+        if isinstance(spec[0], list):
+            return spec[0]
+        if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+            return spec[1].get("options") or []
+    return []
+
+
 def _models_visible() -> bool:
     for node, (field, names) in REQUIRED_MODELS.items():
         r = requests.get(f"{COMFY_URL}/object_info/{node}", timeout=15)
         if not r.ok:
             return False
         spec = (((r.json().get(node) or {}).get("input") or {}).get("required") or {}).get(field)
-        options = spec[0] if isinstance(spec, list) and spec and isinstance(spec[0], list) else []
+        options = _combo_options(spec)
         if not all(n in options for n in names):
             return False
-    r = requests.get(f"{COMFY_URL}/object_info/WanFirstLastFrameToVideo", timeout=15)
-    return r.ok and "WanFirstLastFrameToVideo" in r.json()
+    # ComfyUI answers an unknown node with 200 {}, so check the key itself.
+    r = requests.get(f"{COMFY_URL}/object_info/{H3_NODE}", timeout=15)
+    return r.ok and H3_NODE in r.json()
 
 
 def _readiness_shim() -> None:
@@ -222,48 +239,47 @@ threading.Thread(target=_readiness_shim, daemon=True).start()
 
 
 # ── the clip graph (benchmark + reference for the app's graph builder) ───────
-# Wan 2.2 I2V A14B: the high-noise half runs the first half of the steps and hands
-# its leftover noise to the low-noise half (KSamplerAdvanced pair). The still is
-# pinned as both first and last frame, so the clip loops; the last frame is dropped
-# because it duplicates frame 0 at the seam.
+# MiniMax H3 fl2va, following Comfy-Org's video_minimax_h3_i2v template at this pin:
+# the turbo LoRA's 4 steps of res_multistep through SamplerCustomAdvanced, no audio.
+# For a loop the still is pinned as both first and last frame and the last frame is
+# dropped, because it duplicates frame 0 at the seam; otherwise the ending is free.
+# `yaoi` > 0 chains the yaoi LoRA after the turbo LoRA at that strength.
 
-def make_clip_graph(image_name: str, prompt: str, width: int = 480, height: int = 704,
-                    frames: int = 49, fps: float = 16.0, steps: int = 4, seed: int = 0) -> dict:
-    split = steps // 2
-    return {
+def make_clip_graph(image_name: str, prompt: str, width: int = 512, height: int = 736,
+                    frames: int = 73, fps: float = 24.0, steps: int = 4, seed: int = 0,
+                    loop: bool = True, yaoi: float = 0.0) -> dict:
+    model = ["3", 0]
+    graph = {
         "1": {"class_type": "LoadImage", "inputs": {"image": image_name}},
-        "2": {"class_type": "UNETLoader", "inputs": {"unet_name": WAN_HIGH, "weight_dtype": "default"}},
-        "3": {"class_type": "UNETLoader", "inputs": {"unet_name": WAN_LOW, "weight_dtype": "default"}},
-        "4": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["2", 0], "lora_name": LORA_HIGH, "strength_model": 1.0}},
-        "5": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["3", 0], "lora_name": LORA_LOW, "strength_model": 1.0}},
-        "6": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["4", 0], "shift": 5.0}},
-        "7": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["5", 0], "shift": 5.0}},
-        "8": {"class_type": "CLIPLoader", "inputs": {"clip_name": WAN_TE, "type": "wan", "device": "default"}},
-        "9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["8", 0], "text": prompt}},
-        "10": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["8", 0], "text": ""}},
-        "11": {"class_type": "VAELoader", "inputs": {"vae_name": WAN_VAE}},
-        "12": {"class_type": "WanFirstLastFrameToVideo", "inputs": {
-            "positive": ["9", 0], "negative": ["10", 0], "vae": ["11", 0],
-            "width": width, "height": height, "length": frames, "batch_size": 1,
-            "start_image": ["1", 0], "end_image": ["1", 0]}},
-        "13": {"class_type": "KSamplerAdvanced", "inputs": {
-            "model": ["6", 0], "add_noise": "enable", "noise_seed": seed, "steps": steps, "cfg": 1.0,
-            "sampler_name": "euler", "scheduler": "simple",
-            "positive": ["12", 0], "negative": ["12", 1], "latent_image": ["12", 2],
-            "start_at_step": 0, "end_at_step": split, "return_with_leftover_noise": "enable"}},
-        "14": {"class_type": "KSamplerAdvanced", "inputs": {
-            "model": ["7", 0], "add_noise": "disable", "noise_seed": seed, "steps": steps, "cfg": 1.0,
-            "sampler_name": "euler", "scheduler": "simple",
-            "positive": ["12", 0], "negative": ["12", 1], "latent_image": ["13", 0],
-            "start_at_step": split, "end_at_step": 10000, "return_with_leftover_noise": "disable"}},
-        "15": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0], "vae": ["11", 0]}},
-        "16": {"class_type": "ImageFromBatch", "inputs": {"image": ["15", 0], "batch_index": 0, "length": frames - 1}},
-        "17": {"class_type": "CreateVideo", "inputs": {"images": ["16", 0], "fps": fps}},
-        "18": {"class_type": "SaveVideo", "inputs": {
-            "video": ["17", 0], "filename_prefix": "peepy/clip", "format": "mp4",
+        "2": {"class_type": "UNETLoader", "inputs": {"unet_name": H3_UNET, "weight_dtype": "default"}},
+        "3": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["2", 0], "lora_name": H3_TURBO,
+                                                              "strength_model": 1.0}},
+        "4": {"class_type": "CLIPLoader", "inputs": {"clip_name": H3_TE, "type": "minimax", "device": "default"}},
+        "5": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VAE}},
+        "6": {"class_type": H3_NODE, "inputs": {
+            "clip": ["4", 0], "vae": ["5", 0], "prompt": prompt, "width": width, "height": height,
+            "length": frames, "first_frame": ["1", 0], **({"last_frame": ["1", 0]} if loop else {})}},
+        "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["5", 0]}},
+        "13": {"class_type": "ImageFromBatch", "inputs": {"image": ["12", 0], "batch_index": 0,
+                                                          "length": frames - 1 if loop else frames}},
+        "14": {"class_type": "CreateVideo", "inputs": {"images": ["13", 0], "fps": fps}},
+        "15": {"class_type": "SaveVideo", "inputs": {
+            "video": ["14", 0], "filename_prefix": "peepy/clip", "format": "mp4",
             "format.codec": "h264", "format.codec.encoding": "re-encode",
             "format.codec.encoding.crf": 20.0}},
     }
+    if yaoi > 0:
+        graph["16"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": model, "lora_name": H3_YAOI,
+                                                                       "strength_model": yaoi}}
+        model = ["16", 0]
+    graph["9"] = {"class_type": "BasicScheduler", "inputs": {"model": model, "scheduler": "simple",
+                                                             "steps": steps, "denoise": 1.0}}
+    graph["10"] = {"class_type": "BasicGuider", "inputs": {"model": model, "conditioning": ["6", 0]}}
+    graph["11"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
+        "noise": ["7", 0], "guider": ["10", 0], "sampler": ["8", 0], "sigmas": ["9", 0], "latent_image": ["6", 1]}}
+    return graph
 
 
 def _png(width: int, height: int) -> bytes:
@@ -286,13 +302,24 @@ def _png(width: int, height: int) -> bytes:
 
 
 BENCH_IMAGE = "peepy_bench.png"
-_BENCH_PNG_B64 = base64.b64encode(_png(480, 704)).decode()
+BENCH_W, BENCH_H, BENCH_FRAMES = 512, 736, 73   # ~32 s warm on a 3090
+_BENCH_PNG_B64 = base64.b64encode(_png(BENCH_W, BENCH_H)).decode()
+# H3's own prompt layout (the one the app sends), so the text encoder does real work.
+BENCH_PROMPT = (
+    "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n"
+    "integrated_multimodal_description: [Shot 1] A static shot of the soft colour gradient shown in <Picture 1>, "
+    "preserving its colours and composition. The camera is completely still for the whole clip: no push-in, no pan, "
+    "no zoom. Throughout the clip the colours shimmer gently and a soft glow drifts slowly across the frame. "
+    "No people, no new objects, no text, no cuts.\n"
+    "overall_soundscape: N/A\n"
+    "non_diegetic_music: N/A"
+)
 
 
 def make_benchmark_payload() -> dict:
     return {
-        "prompt": make_clip_graph(BENCH_IMAGE, "a man breathes slowly, subtle natural motion, static camera",
-                                  seed=random.randint(0, 2**31 - 1)),
+        "prompt": make_clip_graph(BENCH_IMAGE, BENCH_PROMPT, width=BENCH_W, height=BENCH_H,
+                                  frames=BENCH_FRAMES, seed=random.randint(0, 2**31 - 1)),
         "timeout_s": 900,
         "images": {BENCH_IMAGE: _BENCH_PNG_B64},
         # The framework counts any returned value as a passing benchmark run; an
@@ -301,25 +328,52 @@ def make_benchmark_payload() -> dict:
     }
 
 
+def h3_est_seconds(width: float, height: float, frames: float, steps: float = 4.0) -> float:
+    """GPU seconds for one H3 clip on an RTX 3090 with the 4-step turbo LoRA: a fit to
+    every measured render (SD 512x672 5 s = 45 s ... Full 1024x1376 5 s = 318-352 s), within
+    ~10%. The app's clipEstSeconds is the same formula and sends it as the /route/ cost."""
+    fmp = float(frames) * float(width) * float(height) / 1e6
+    return 6.0 + float(steps) * fmp * (0.18 + 0.0016 * fmp)
+
+
+# Anything the estimate can't read (no video node, a linked width...) is priced as the
+# benchmark clip.
+DEFAULT_WORKLOAD = h3_est_seconds(BENCH_W, BENCH_H, BENCH_FRAMES)
+# Wan 2.2 graphs (the pre-H3 app): frames x megapixels x steps at the 1.50 units/s the Wan
+# benchmark measured on a 3090. Only a box provisioned before H3 still holds the Wan
+# weights; a fresh H3 worker refuses such a graph at validation in under a second.
+WAN_UNITS_PER_S = 1.5
+
+
 def clip_workload(payload: dict) -> float:
-    """frames × megapixels × sampler steps, read from the graph. The benchmark measures
-    throughput in these same units, so wait_time = queued workload ÷ throughput comes out
-    in seconds. The default 49-frame 480×704 4-step clip = ~66 units."""
+    """Estimated GPU seconds, read from the graph (the H3 node's width/height/length and
+    BasicScheduler's steps). The benchmark measures throughput in these same units
+    (~1 per second), so wait_time = queued workload / throughput comes out in seconds and
+    max_queue_time means what it says."""
     try:
         graph = payload.get("prompt") or {}
-        frames, w, h, steps = 49.0, 480.0, 704.0, 4.0
+        h3 = wan = None
+        steps, wan_steps = 4.0, 4.0
         for node in graph.values():
+            if not isinstance(node, dict):
+                continue
             ct = node.get("class_type")
             inp = node.get("inputs") or {}
-            if ct in ("WanFirstLastFrameToVideo", "WanImageToVideo"):
-                frames = float(inp.get("length", frames))
-                w = float(inp.get("width", w))
-                h = float(inp.get("height", h))
-            elif ct in ("KSamplerAdvanced", "KSampler"):
+            if ct == H3_NODE:
+                h3 = (float(inp.get("width", 1344)), float(inp.get("height", 768)), float(inp.get("length", 124)))
+            elif ct == "BasicScheduler":
                 steps = float(inp.get("steps", steps))
-        return frames * (w * h / 1e6) * steps
+            elif ct in ("WanFirstLastFrameToVideo", "WanImageToVideo"):
+                wan = (float(inp.get("width", 480)), float(inp.get("height", 704)), float(inp.get("length", 49)))
+            elif ct in ("KSamplerAdvanced", "KSampler"):
+                wan_steps = float(inp.get("steps", wan_steps))
+        if h3:
+            return h3_est_seconds(h3[0], h3[1], h3[2], steps)
+        if wan:
+            return wan[2] * (wan[0] * wan[1] / 1e6) * wan_steps / WAN_UNITS_PER_S
+        return DEFAULT_WORKLOAD
     except Exception:
-        return 66.0
+        return DEFAULT_WORKLOAD
 
 
 # ── ComfyUI render (remote-dispatch) ─────────────────────────────────────────
@@ -545,7 +599,7 @@ worker_config = WorkerConfig(
             benchmark_config=BenchmarkConfig(
                 generator=make_benchmark_payload,
                 concurrency=1,
-                runs=1,          # each run is a full clip (~2 min); the warmup also loads the models
+                runs=1,          # each run is a full clip (~32 s warm); the warmup also stages the ~38 GB of weights
             ),
         ),
     ],

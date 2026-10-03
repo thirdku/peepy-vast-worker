@@ -5,11 +5,15 @@
 # runs PYWORKER_REF=video; the image fleet keeps vast-provisioning-neo.sh on `neo`.
 #
 # A video worker is ComfyUI ONLY: no Forge, no image models, no R2 image sync. The
-# whole card goes to Wan 2.2 I2V A14B (two fp8 halves, ~14.3 GB each, swapped in
-# and out per clip), so nothing else may hold VRAM.
+# whole card goes to MiniMax H3 fl2va (image-to-video): the int8 transformer (~21 GB),
+# the nvfp4 Qwen3-VL text encoder (~15.7 GB) and the int8 video VAE (~2.8 GB), with the
+# 4-step turbo LoRA and the yaoi LoRA for two-man clips: ~41.6 GB in all. A 5 s clip at
+# 1024x1376 peaks at 23.8 of 24.5 GB on a 3090, so nothing else may hold VRAM.
+# (Until Oct 2026 this branch provisioned Wan 2.2 I2V A14B; H3 replaced it.)
 #
-# Models come from Hugging Face (all public). If R2 ever holds a mirror under
-# peepy-models/video/<dir>/, it is tried first and Hugging Face only fills gaps.
+# Models come from Hugging Face (Comfy-Org/MiniMax-H3, pinned to one revision) and
+# Civitai (the yaoi LoRA), all public. If R2 ever holds a mirror under
+# peepy-models/video/<dir>/, it is tried first and the public hosts only fill gaps.
 # Video weights NEVER go into the image folders of the bucket (checkpoints/, lora/,
 # text_encoders/, vae/…): every image worker syncs those at boot.
 #
@@ -21,22 +25,25 @@ source /venv/main/bin/activate 2>/dev/null || true
 COMFY_DIR=${WORKSPACE:-/workspace}/ComfyUI
 COMFY_VENV=${WORKSPACE:-/workspace}/comfy-venv
 COMFY_PORT=${COMFY_INTERNAL_PORT:-8188}
-# Same pin as the image fleet's sidecar: it already ships the Wan, CreateVideo and
-# SaveVideo nodes (checked on the live workers, Oct 3 2026). Roll forward only by
-# canarying a new SHA on a disposable box first.
+# Same pin as the image fleet's sidecar. It ships everything H3 needs (checked on the
+# live video worker, Oct 3 2026): the core MiniMaxH3ImageToVideo node, CLIPLoader type
+# `minimax`, and comfy-kitchen (from ComfyUI's own requirements) with the int8_convrot
+# and nvfp4 kernels. int8_convrot needs torch cu130, hence a driver >= 580. Roll
+# forward only by canarying a new SHA on a disposable box first.
 COMFY_PIN=b16023b004d3b1bfbbd6463414dc20da1b36cc4d
 
 HF=https://huggingface.co
-WAN_REPO="$HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files"
-LORA_REPO="$HF/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22_Lightx2v"
-# dir under ComfyUI/models | file name | url | minimum size in bytes (catches truncated downloads)
+# Pinned revision: a moved `main` can never swap the weights under a running fleet.
+H3_REPO="$HF/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6"
+# dir under ComfyUI/models | file name | url | exact size in bytes | sha256 (optional)
+# Hugging Face files are pinned by revision and checked by exact size; the Civitai file
+# also by sha256 (it comes from a less trustworthy host, and from a signed redirect).
 VIDEO_MODELS=(
-    "diffusion_models|wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors|$WAN_REPO/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors|14000000000"
-    "diffusion_models|wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors|$WAN_REPO/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors|14000000000"
-    "text_encoders|umt5_xxl_fp8_e4m3fn_scaled.safetensors|$WAN_REPO/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors|6500000000"
-    "vae|wan_2.1_vae.safetensors|$WAN_REPO/vae/wan_2.1_vae.safetensors|240000000"
-    "loras|Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_260412_rank_64_fp16.safetensors|$LORA_REPO/Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_260412_rank_64_fp16.safetensors|600000000"
-    "loras|Wan_2_2_I2V_A14B_LOW_lightx2v_4step_lora_260412_rank_64_fp16.safetensors|$LORA_REPO/Wan_2_2_I2V_A14B_LOW_lightx2v_4step_lora_260412_rank_64_fp16.safetensors|600000000"
+    "diffusion_models|minimax_h3_fl2va_pruned_int8_convrot.safetensors|$H3_REPO/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors|20970379616|"
+    "text_encoders|qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|$H3_REPO/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|15687142551|"
+    "vae|minimax_h3_video_vae_int8_convrot.safetensors|$H3_REPO/vae/minimax_h3_video_vae_int8_convrot.safetensors|2811065184|"
+    "loras|minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|$H3_REPO/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|1956192992|"
+    "loras|yaoi_h3_lora_000002500.safetensors|https://civitai.com/api/download/models/3234992?fileId=3117398|155110336|F769A344264F620957C24916F376F5C1A83DEFDE45FD43351BECA2ECA0F6E381"
 )
 
 function provisioning_start() {
@@ -84,46 +91,70 @@ function provisioning_install_comfyui() {
     echo "[provision] ComfyUI installed at ${COMFY_DIR} (pin ${COMFY_PIN:0:8})"
 }
 
-# ── Models: R2 mirror first (if any), then Hugging Face, all four big files in parallel ─
+# ── Models: R2 mirror first (if any), then the public hosts, all five files in parallel ─
+# 0 when $1 exists with exactly $2 bytes and, when $3 is set, that sha256 (any case).
+function file_ok() {
+    local f="$1" size="$2" sha="$3"
+    [[ -f "$f" ]] && (( $(stat -c %s "$f") == size )) || return 1
+    [[ -z "$sha" ]] && return 0
+    [[ "$(sha256sum "$f" | cut -d' ' -f1)" == "${sha,,}" ]]
+}
+
 function fetch_one() {
-    local dir="$1" name="$2" url="$3" min="$4"
+    local dir="$1" name="$2" url="$3" size="$4" sha="$5"
     local dest="$COMFY_DIR/models/$dir/$name"
     mkdir -p "$COMFY_DIR/models/$dir"
-    if [[ -f "$dest" ]] && (( $(stat -c %s "$dest") >= min )); then
+    if file_ok "$dest" "$size" "$sha"; then
         echo "[provision] have $name"
         return 0
     fi
+    rm -f "$dest"
     if command -v rclone >/dev/null && [[ -n "$R2_BUCKET" && -n "$RCLONE_CONFIG_R2_ENDPOINT" ]]; then
         rclone copyto "r2:${R2_BUCKET}/video/${dir}/${name}" "$dest" \
             --multi-thread-streams 8 --retries 3 -q 2>/dev/null || true
-        if [[ -f "$dest" ]] && (( $(stat -c %s "$dest") >= min )); then
+        if file_ok "$dest" "$size" "$sha"; then
             echo "[provision] $name from R2"
             return 0
         fi
+        rm -f "$dest"
     fi
+    # The Hugging Face token (optional) goes to Hugging Face only, never to Civitai.
     local auth=()
-    [[ -n "$HF_TOKEN" ]] && auth=(--header="Authorization: Bearer $HF_TOKEN")
-    local i
+    [[ -n "$HF_TOKEN" && "$url" == "$HF/"* ]] && auth=(--header="Authorization: Bearer $HF_TOKEN")
+    # -c resumes $dest.part, which is kept between attempts AND between runs of this
+    # script (the base image re-runs it after a failure), so a drop 18 GB into the
+    # 21 GB transformer costs the last 3 GB, not all 21. Both hosts honour Range. Civitai
+    # refuses wget's default user agent, hence Mozilla/5.0. The file check decides, not
+    # wget's exit code.
+    local i got
     for i in 1 2 3; do
-        rm -f "$dest.part"
-        if wget -q "${auth[@]}" -O "$dest.part" "$url" && (( $(stat -c %s "$dest.part") >= min )); then
+        if [[ -f "$dest.part" ]] && (( $(stat -c %s "$dest.part") > size )); then
+            rm -f "$dest.part"
+        fi
+        wget -c -q --read-timeout=120 --user-agent="Mozilla/5.0" "${auth[@]}" -O "$dest.part" "$url"
+        if file_ok "$dest.part" "$size" "$sha"; then
             mv "$dest.part" "$dest"
-            echo "[provision] $name from Hugging Face"
+            echo "[provision] $name downloaded"
             return 0
         fi
-        echo "[provision] $name download attempt $i failed — retrying"
+        got=$(stat -c %s "$dest.part" 2>/dev/null || echo 0)
+        # Full length but the wrong bytes (sha256 mismatch): resuming can't fix that.
+        if (( got >= size )); then
+            echo "[provision] $name: $got bytes but the wrong checksum — starting over"
+            rm -f "$dest.part"
+        fi
+        echo "[provision] $name download attempt $i failed ($got of $size bytes) — resuming"
         sleep 10
     done
-    rm -f "$dest.part"
-    echo "[provision] FATAL: could not fetch $name"
+    echo "[provision] FATAL: could not fetch $name (partial file kept for the next run to resume)"
     return 1
 }
 
 function provisioning_get_models() {
     local entry pids=() failed=0
     for entry in "${VIDEO_MODELS[@]}"; do
-        IFS='|' read -r dir name url min <<< "$entry"
-        fetch_one "$dir" "$name" "$url" "$min" &
+        IFS='|' read -r dir name url size sha <<< "$entry"
+        fetch_one "$dir" "$name" "$url" "$size" "$sha" &
         pids+=($!)
     done
     local p
@@ -166,8 +197,38 @@ COMFYC
 # exit 1 → the base image retries the script, then marks /.provisioning_failed and
 # carries on; worker.py sees that marker and reports PEEPY_VIDEO_START_FAILED, so the
 # worker errors out instead of going ready. The benchmark clip is the final proof.
+
+# 0 when ComfyUI's /object_info lists $3 among the options of input $2 on node $1.
+# This pin serves two schema shapes: the loaders still send [["a","b"], {...}], newer
+# nodes (KSamplerSelect, BasicScheduler) send ["COMBO", {"options": ["a","b"]}].
+function comfy_option() {
+    "${COMFY_VENV}/bin/python" - "$COMFY_PORT" "$1" "$2" "$3" <<'PY' >/dev/null 2>&1
+import json, sys, urllib.request
+port, node, field, want = sys.argv[1:5]
+with urllib.request.urlopen(f"http://127.0.0.1:{port}/object_info/{node}", timeout=15) as r:
+    inputs = (json.load(r).get(node) or {}).get("input") or {}
+spec = (inputs.get("required") or {}).get(field) or (inputs.get("optional") or {}).get(field) or []
+opts = []
+if spec and isinstance(spec[0], list):
+    opts = spec[0]
+elif spec and spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+    opts = spec[1].get("options") or []
+sys.exit(0 if want in opts else 1)
+PY
+}
+
+# The loader node + input that must list a file of each models/ folder.
+function loader_for() {
+    case "$1" in
+        diffusion_models) echo "UNETLoader unet_name" ;;
+        text_encoders)    echo "CLIPLoader clip_name" ;;
+        vae)              echo "VAELoader vae_name" ;;
+        loras)            echo "LoraLoaderModelOnly lora_name" ;;
+    esac
+}
+
 function provisioning_verify() {
-    local ok=1 entry
+    local ok=1 entry dir name url size sha
     [[ -f "${COMFY_DIR}/main.py" ]] || { echo "[provision] FATAL: ComfyUI missing"; ok=0; }
     "${COMFY_VENV}/bin/python" -c "import torch, aiohttp, av" 2>/dev/null \
         || { echo "[provision] FATAL: comfy venv broken (torch/aiohttp/av)"; ok=0; }
@@ -175,14 +236,18 @@ function provisioning_verify() {
         || { echo "[provision] FATAL: PyAV has no libx264 (SaveVideo can't write mp4)"; ok=0; }
     "${COMFY_VENV}/bin/python" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null \
         || { echo "[provision] FATAL: torch sees no CUDA device"; ok=0; }
+    "${COMFY_VENV}/bin/python" -c "import comfy_kitchen" 2>/dev/null \
+        || { echo "[provision] FATAL: comfy-kitchen missing (H3's int8_convrot / nvfp4 kernels)"; ok=0; }
     for entry in "${VIDEO_MODELS[@]}"; do
-        IFS='|' read -r dir name url min <<< "$entry"
-        local f="$COMFY_DIR/models/$dir/$name"
-        [[ -f "$f" ]] && (( $(stat -c %s "$f") >= min )) || { echo "[provision] FATAL: $dir/$name missing or short"; ok=0; }
+        IFS='|' read -r dir name url size sha <<< "$entry"
+        file_ok "$COMFY_DIR/models/$dir/$name" "$size" "$sha" \
+            || { echo "[provision] FATAL: $dir/$name missing, wrong size or wrong checksum"; ok=0; }
     done
     # ComfyUI itself must come up and register the nodes the clip graph uses.
-    local node i up
-    for node in SaveVideo CreateVideo WanFirstLastFrameToVideo KSamplerAdvanced; do
+    local node i up served=1
+    for node in MiniMaxH3ImageToVideo SamplerCustomAdvanced BasicGuider BasicScheduler KSamplerSelect \
+                RandomNoise ImageFromBatch ImageCrop CreateVideo SaveVideo \
+                LoraLoaderModelOnly UNETLoader CLIPLoader VAELoader; do
         up=0
         for i in $(seq 1 60); do
             if curl -sf --max-time 10 "http://127.0.0.1:${COMFY_PORT}/object_info/${node}" | grep -q "\"${node}\""; then
@@ -190,8 +255,21 @@ function provisioning_verify() {
             fi
             sleep 5
         done
-        (( up )) || { echo "[provision] FATAL: ComfyUI never served node ${node}"; ok=0; break; }
+        (( up )) || { echo "[provision] FATAL: ComfyUI never served node ${node}"; ok=0; served=0; break; }
     done
+    if (( served )); then
+        comfy_option CLIPLoader type minimax \
+            || { echo "[provision] FATAL: CLIPLoader has no 'minimax' type (ComfyUI too old for H3)"; ok=0; }
+        comfy_option KSamplerSelect sampler_name res_multistep \
+            || { echo "[provision] FATAL: KSamplerSelect has no 'res_multistep' sampler"; ok=0; }
+        local loader field
+        for entry in "${VIDEO_MODELS[@]}"; do
+            IFS='|' read -r dir name url size sha <<< "$entry"
+            read -r loader field <<< "$(loader_for "$dir")"
+            comfy_option "$loader" "$field" "$name" \
+                || { echo "[provision] FATAL: ComfyUI's ${loader} doesn't list ${name}"; ok=0; }
+        done
+    fi
     if [[ $ok -eq 0 ]]; then
         echo "[provision] VERIFICATION FAILED — worker is not usable"
         exit 1
