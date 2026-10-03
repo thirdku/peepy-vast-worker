@@ -217,7 +217,7 @@ function provisioning_sync_models() {
         curl -fsSL https://rclone.org/install.sh | bash
     fi
     sync_pair "checkpoints"   "${NEO_DIR}/models/Stable-diffusion"
-    sync_pair "lora"          "${NEO_DIR}/models/Lora"
+    sync_pair "lora"          "${NEO_DIR}/models/Lora"            mirror
     sync_pair "embeddings"    "${NEO_DIR}/models/embeddings"
     sync_pair "text_encoders" "${NEO_DIR}/models/text_encoder"
     sync_pair "vae"           "${NEO_DIR}/models/VAE"
@@ -235,12 +235,18 @@ function provisioning_sync_models() {
 }
 
 function sync_pair() {
-    local src="r2:${R2_BUCKET}/$1" dst="$2"
+    local src="r2:${R2_BUCKET}/$1" dst="$2" mode="${3:-copy}"
     mkdir -p "$dst"
-    echo "[provision] syncing ${src} → ${dst}"
-    rclone copy "$src" "$dst" \
+    # mode=mirror → rclone sync: adds/updates AND deletes local files no longer in
+    # R2 (a true mirror). --max-delete 50 fuses a transient/empty R2 listing so it
+    # can never wipe the whole folder. Default copy mode never deletes — keep it for
+    # dirs that also hold non-R2 files (controlnet_preprocessor's HF annotators).
+    local verb=copy; local extra=()
+    if [ "$mode" = mirror ]; then verb=sync; extra=(--max-delete 50); fi
+    echo "[provision] ${verb}ing ${src} → ${dst}"
+    rclone "$verb" "$src" "$dst" \
         --transfers 4 --multi-thread-streams 8 --multi-thread-cutoff 64M \
-        --retries 5 --low-level-retries 20 --stats-one-line --stats 15s -v
+        --retries 5 --low-level-retries 20 --stats-one-line --stats 15s -v "${extra[@]}"
 }
 
 # ── Config: infotext OFF + deterministic couple faces (same as old fleet) ────
@@ -307,7 +313,7 @@ done
 # rclone skips unchanged files, so a no-change boot costs only listings (~5s).
 if command -v rclone >/dev/null && [ -n "\$R2_BUCKET" ]; then
     rclone copy "r2:\$R2_BUCKET/checkpoints"   "$NEO_DIR/models/Stable-diffusion" --transfers 4 -q || true
-    rclone copy "r2:\$R2_BUCKET/lora"          "$NEO_DIR/models/Lora"             --transfers 4 -q || true
+    rclone sync "r2:\$R2_BUCKET/lora"          "$NEO_DIR/models/Lora"             --transfers 4 --max-delete 50 -q || true
     rclone copy "r2:\$R2_BUCKET/embeddings"    "$NEO_DIR/models/embeddings"       --transfers 4 -q || true
     rclone copy "r2:\$R2_BUCKET/text_encoders" "$NEO_DIR/models/text_encoder"     --transfers 4 -q || true
     rclone copy "r2:\$R2_BUCKET/vae"           "$NEO_DIR/models/VAE"              --transfers 4 -q || true
@@ -365,10 +371,11 @@ fi
 if ! command -v rclone >/dev/null || [ -z "$R2_BUCKET" ]; then
     echo "[model-sync] rclone or R2_BUCKET missing — idling"; exec sleep infinity
 fi
-sync_one() {  # $1 r2 subdir, $2 local dir -> stdout 'changed' when files moved
-    local out
-    out="$(rclone copy "r2:$R2_BUCKET/$1" "$2" --transfers 4 --log-level INFO 2>&1)"
-    echo "$out" | grep -qE 'Copied|Updated' && echo changed
+sync_one() {  # $1 r2 subdir, $2 local dir, $3 mode(copy|mirror) -> 'changed' when files moved
+    local out mode="${3:-copy}" verb=copy extra=()
+    if [ "$mode" = mirror ]; then verb=sync; extra=(--max-delete 50); fi
+    out="$(rclone "$verb" "r2:$R2_BUCKET/$1" "$2" --transfers 4 "${extra[@]}" --log-level INFO 2>&1)"
+    echo "$out" | grep -qE 'Copied|Updated|Deleted' && echo changed
 }
 while [ -f /.provisioning ]; do sleep 5; done
 echo "[model-sync] active — every ${INTERVAL_MIN}min from r2:${R2_BUCKET} (Forge :${PORT})"
@@ -376,7 +383,7 @@ while true; do
     sleep $((INTERVAL_MIN*60))
     ck=""; lo=""
     [ -n "$(sync_one checkpoints "$NEO_DIR/models/Stable-diffusion")" ] && ck=1
-    [ -n "$(sync_one lora        "$NEO_DIR/models/Lora")" ]            && lo=1
+    [ -n "$(sync_one lora        "$NEO_DIR/models/Lora" mirror)" ]     && lo=1
     sync_one embeddings    "$NEO_DIR/models/embeddings"   >/dev/null
     sync_one text_encoders "$NEO_DIR/models/text_encoder" >/dev/null
     sync_one vae           "$NEO_DIR/models/VAE"          >/dev/null
