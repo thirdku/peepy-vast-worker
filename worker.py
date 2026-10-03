@@ -1,73 +1,68 @@
-"""Peepy Forge pyworker — makes SD Forge serverless-compatible on Vast.ai.
+"""Peepy VIDEO pyworker — ComfyUI-only image-to-video worker for Vast.ai serverless.
 
-Fronts Forge's /sdapi/v1/txt2img on the peepy worker template
-(vastai/sd-forge image, Forge on internal port 17860, supervisor piping its
-output to /var/log/portal/forge.log). Deployed by setting PYWORKER_REPO to
-this repo on the serverless template; Vast's startup clones it, installs
-requirements.txt, and runs `python worker.py`.
+Branch `video` of this repo (Oct 2026). The peepy-anima endpoint's template sets
+PYWORKER_REF=video and provisions with vast-provisioning-video.sh from this branch;
+the image fleet runs branch `neo` and never loads this file.
 
-Readiness: instead of matching Forge's stdout wording (fragile across
-builds), a background shim probes /sdapi/v1/sd-models until Forge answers
-with a non-empty model list, then appends FORGE_READY to the tailed log —
-the same pattern the official comfyui-json worker uses. on_error matches
-ONLY our own FORGE_START_FAILED token: Forge prints tracebacks for bad
-per-request input too, and an on_error match permanently kills the worker.
-
-The benchmark payload mirrors a real peepy selfie render (checkpoint +
-LoRAs + TI embeddings in the negative + ADetailer face pass), so it doubles
-as an end-to-end canary: a worker whose models didn't provision correctly
-fails its benchmark and never receives traffic.
+How it differs from neo's worker.py:
+  • No Forge. ComfyUI is the model server, so readiness, liveness and the benchmark
+    all go through ComfyUI (a neo worker's health gates on a Forge probe render,
+    which a ComfyUI-only box can never pass).
+  • /comfy/render returns every saved output with its type, so a SaveVideo mp4
+    comes back next to (or instead of) still images.
+  • A render that times out, or whose caller disconnects, is interrupted inside
+    ComfyUI. Otherwise the GPU keeps rendering an orphaned clip while the pyworker
+    reports itself idle, and the next clip queues behind it inside ComfyUI.
+  • A CUDA fault seen in any render latches /health to 503 until the process
+    restarts: a poisoned GPU context fails every later render, but ComfyUI's HTTP
+    API keeps answering, so liveness alone never notices.
 """
 
 import asyncio
 import base64
 import os
 import random
+import re
+import shutil
+import struct
 import threading
 import time
+import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiohttp
 import requests
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
-FORGE_PORT = int(os.environ.get("FORGE_INTERNAL_PORT", "17860"))
-FORGE_URL = f"http://127.0.0.1:{FORGE_PORT}"
-# ComfyUI sidecar (Sep 2026, Anima workers only): a second render backend on the
-# same box, sharing Forge's model files via extra_model_paths.yaml. Reached
-# through the /comfy/render handler below; absent/down ComfyUI just errors that
-# one route — Forge routes are untouched.
 COMFY_PORT = int(os.environ.get("COMFY_INTERNAL_PORT", "8188"))
 COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
-LOG_FILE = os.environ.get("MODEL_LOG_FILE", "/var/log/portal/forge.log")
-BENCHMARK_CHECKPOINT = os.environ.get("FORGE_MODEL", "homosimileXLPony_v40NAIXLEPS")
-# First boot loads a ~7GB checkpoint from disk after provisioning; be patient.
-STARTUP_TIMEOUT_S = int(os.environ.get("FORGE_STARTUP_TIMEOUT", "1800"))
+COMFY_DIR = os.environ.get("COMFY_DIR", "/workspace/ComfyUI")
+LOG_FILE = os.environ.get("MODEL_LOG_FILE", "/workspace/comfy.log")
+# A fresh worker loads ~37 GB of Wan weights on its first render; be patient.
+STARTUP_TIMEOUT_S = int(os.environ.get("VIDEO_STARTUP_TIMEOUT", "2400"))
 
-READY_TOKEN = "FORGE_READY"
-FAIL_TOKEN = "FORGE_START_FAILED"
+READY_TOKEN = "PEEPY_VIDEO_READY"
+FAIL_TOKEN = "PEEPY_VIDEO_START_FAILED"
 
-# ── health (Sep 2 2026) ───────────────────────────────────────────────────────
-# The framework's readiness used to be "an on_load token appeared in the log" + a cached
-# benchmark. The log was never rotated, so every RESTART re-read a stale FORGE_READY from
-# a previous boot and the worker advertised itself ready ~8s after boot while Forge was
-# still 15-30s from serving (empty 500s / 404s / hang-ups for every render routed in that
-# window — and a worker whose Forge could not start at all, e.g. a host with a broken GPU
-# driver, sat "ready" forever and black-holed the queue). Two fixes:
-#   • the template now sets ROTATE_MODEL_LOG=true (start_server.sh truncates the log per
-#     start) so on_load can only fire from THIS boot's probe render;
-#   • model_healthcheck_url below: the framework will not mark the model loaded until this
-#     endpoint answers 200, and marks the worker ERRORED if it later stops answering — so
-#     a dead Forge takes the worker out of routing instead of eating renders.
-# /health = 200 only when (a) this boot's probe render has passed and (b) Forge's API has
-# answered within the last LIVENESS_GRACE_S. The grace window rides out supervisor
-# restarting Forge after a crash (~15s) without convicting a worker that will recover.
-# Rotate the model log OURSELVES at import time (Sep 2 2026). Vast's start_server.sh only
-# rotates when the template sets ROTATE_MODEL_LOG=true + MODEL_LOG, and the account API key
-# can't edit templates — so do the equivalent here, BEFORE the framework opens the file: the
-# tailer reads from the START of the file, so any FORGE_READY left by a previous boot would be
-# consumed as "loaded" ~8s after boot. This runs at module import, ahead of the readiness thread
-# and ahead of Worker().run(), so the framework can only ever see THIS boot's token.
+# The files vast-provisioning-video.sh installs under ComfyUI/models/.
+WAN_HIGH = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+WAN_LOW = "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+WAN_TE = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+WAN_VAE = "wan_2.1_vae.safetensors"
+LORA_HIGH = "Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_260412_rank_64_fp16.safetensors"
+LORA_LOW = "Wan_2_2_I2V_A14B_LOW_lightx2v_4step_lora_260412_rank_64_fp16.safetensors"
+REQUIRED_MODELS = {
+    "UNETLoader": ("unet_name", [WAN_HIGH, WAN_LOW]),
+    "CLIPLoader": ("clip_name", [WAN_TE]),
+    "VAELoader": ("vae_name", [WAN_VAE]),
+    "LoraLoaderModelOnly": ("lora_name", [LORA_HIGH, LORA_LOW]),
+}
+
+
+# Rotate the model log at import, before the framework opens it: the tailer reads from
+# the start of the file, so a READY_TOKEN left by a previous boot would mark this boot
+# loaded before ComfyUI is up (the same fix neo's worker.py carries).
 def _rotate_model_log() -> None:
     try:
         if not os.path.isfile(LOG_FILE):
@@ -77,7 +72,6 @@ def _rotate_model_log() -> None:
             dst.write(src.read())
         with open(LOG_FILE, "r+b") as f:
             f.truncate(0)
-        # keep .old bounded (~20 MB) — supervisor's own 10 MB×1 rotation only covers the live file
         if os.path.getsize(old) > 20 * 1024 * 1024:
             with open(old, "rb") as f:
                 f.seek(-10 * 1024 * 1024, os.SEEK_END)
@@ -85,24 +79,72 @@ def _rotate_model_log() -> None:
             with open(old, "wb") as f:
                 f.write(tail)
     except Exception:
-        pass  # a failed rotation just means the old behaviour (healthcheck still gates readiness)
+        pass
 
 
 _rotate_model_log()
 
-HEALTH_PORT = int(os.environ.get("FORGE_HEALTH_PORT", "17870"))
-LIVENESS_GRACE_S = int(os.environ.get("FORGE_LIVENESS_GRACE_S", "90"))
-_probe_passed = False
-_last_forge_ok = 0.0
+
+# The framework skips the benchmark when it finds .has_benchmark in its working dir,
+# and that file survives a restart. Remove it so every boot renders a proof clip: a
+# worker whose GPU or weights went bad since the last boot must fail before it serves.
+def _forget_benchmark() -> None:
+    for d in {os.getcwd(), os.path.dirname(os.path.abspath(__file__))}:
+        try:
+            os.remove(os.path.join(d, ".has_benchmark"))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
+_forget_benchmark()
+
+
+# ── health ───────────────────────────────────────────────────────────────────
+# /health = 200 only when this boot's readiness check passed, ComfyUI answered within
+# the last LIVENESS_GRACE_S (rides out a supervisor restart), and no render has hit a
+# CUDA fault. The framework errors the worker out of routing on a non-200.
+
+HEALTH_PORT = int(os.environ.get("VIDEO_HEALTH_PORT", "17870"))
+LIVENESS_GRACE_S = int(os.environ.get("VIDEO_LIVENESS_GRACE_S", "90"))
+_ready = False
+_last_comfy_ok = 0.0
+_gpu_fault = ""
+
+# Errors that leave the CUDA context unusable for the rest of the process. "Fault
+# failed" is how the same fault surfaced through ComfyUI on Sep 26 2026. Out-of-memory
+# is recoverable and must never latch.
+CUDA_FATAL = re.compile(
+    r"illegal memory access|cudaErrorIllegalAddress|cudaErrorUnknown|CUDA error: unknown error"
+    r"|unspecified launch failure|cudaErrorLaunchFailure|misaligned address|device-side assert"
+    r"|uncorrectable ECC|no CUDA-capable device|No CUDA GPUs are available|fallen off the bus"
+    r"|CUBLAS_STATUS_EXECUTION_FAILED|CUDNN_STATUS_EXECUTION_FAILED|AcceleratorError|Fault failed",
+    re.I,
+)
+NOT_FATAL = re.compile(r"out of memory|OutOfMemoryError|ALLOC_FAILED", re.I)
+
+
+def _note_render_error(detail) -> None:
+    global _gpu_fault
+    # Only the error fields: ComfyUI's execution_error also carries the node's inputs,
+    # i.e. the user's prompt text, which must never be able to trip (or mask) the latch.
+    if isinstance(detail, dict):
+        text = " ".join(str(detail.get(k, "")) for k in ("exception_type", "exception_message", "traceback"))
+    else:
+        text = str(detail)
+    if CUDA_FATAL.search(text) and not NOT_FATAL.search(text):
+        if not _gpu_fault:
+            _gpu_fault = text[:300]
+            _append_log(f"PEEPY_VIDEO_GPU_FAULT {_gpu_fault}")
 
 
 def _liveness_loop() -> None:
-    global _last_forge_ok
+    global _last_comfy_ok
     while True:
         try:
-            r = requests.get(f"{FORGE_URL}/sdapi/v1/progress", params={"skip_current_image": "true"}, timeout=5)
-            if r.ok:
-                _last_forge_ok = time.time()
+            if requests.get(f"{COMFY_URL}/system_stats", timeout=5).ok:
+                _last_comfy_ok = time.time()
         except Exception:
             pass
         time.sleep(5)
@@ -110,15 +152,15 @@ def _liveness_loop() -> None:
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 — http.server API
-        alive = _probe_passed and (time.time() - _last_forge_ok) < LIVENESS_GRACE_S
-        body = b"ok" if alive else b"not ready"
+        alive = _ready and not _gpu_fault and (time.time() - _last_comfy_ok) < LIVENESS_GRACE_S
+        body = b"ok" if alive else (b"gpu fault" if _gpu_fault else b"not ready")
         self.send_response(200 if alive else 503)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *_args) -> None:  # keep the pyworker log clean (polled every 10s)
+    def log_message(self, *_args) -> None:
         return
 
 
@@ -131,47 +173,43 @@ threading.Thread(target=_serve_health, daemon=True).start()
 
 
 # ── readiness shim ───────────────────────────────────────────────────────────
+# ComfyUI up + every Wan file visible to its loaders. The real proof — a rendered
+# clip — is the framework's benchmark, which runs right after READY_TOKEN.
 
 def _append_log(line: str) -> None:
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
-
-
-def _probe_render() -> bool:
-    """Prove the API can serve PRODUCTION payloads, not just list models.
-
-    Forge Neo answers /sdapi before its extension script-arg tables settle —
-    any request carrying alwayson_scripts in that window 500s with
-    "list assignment index out of range" (seen live, Jul 19 2026). A tiny real
-    render with a disabled ADetailer block exercises exactly that table, and
-    doubles as the checkpoint pre-warm before the benchmark runs.
-    """
-    payload = {
-        "prompt": "1boy", "negative_prompt": "girl",
-        "steps": 1, "width": 256, "height": 320, "cfg_scale": 5,
-        "sampler_name": "Euler a", "seed": 1,
-        "send_images": False, "save_images": False,
-        "override_settings": {"sd_model_checkpoint": BENCHMARK_CHECKPOINT},
-        "override_settings_restore_afterwards": False,
-        # Disabled block: parses through the arg table without running detection.
-        "alwayson_scripts": {"ADetailer": {"args": [False, False, {"ad_model": "None"}]}},
-    }
     try:
-        r = requests.post(f"{FORGE_URL}/sdapi/v1/txt2img", json=payload, timeout=300)
-        return r.ok
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
     except Exception:
-        return False
+        pass
+
+
+def _models_visible() -> bool:
+    for node, (field, names) in REQUIRED_MODELS.items():
+        r = requests.get(f"{COMFY_URL}/object_info/{node}", timeout=15)
+        if not r.ok:
+            return False
+        spec = (((r.json().get(node) or {}).get("input") or {}).get("required") or {}).get(field)
+        options = spec[0] if isinstance(spec, list) and spec and isinstance(spec[0], list) else []
+        if not all(n in options for n in names):
+            return False
+    r = requests.get(f"{COMFY_URL}/object_info/WanFirstLastFrameToVideo", timeout=15)
+    return r.ok and "WanFirstLastFrameToVideo" in r.json()
 
 
 def _readiness_shim() -> None:
-    global _probe_passed
+    global _ready
     deadline = time.time() + STARTUP_TIMEOUT_S
     while time.time() < deadline:
+        # The base image runs the provisioning script with on_failure=continue: a failed
+        # script leaves this marker and starts the pyworker anyway. Never go ready then.
+        if os.path.exists("/.provisioning_failed"):
+            _append_log("provisioning failed: /.provisioning_failed exists")
+            break
         try:
-            r = requests.get(f"{FORGE_URL}/sdapi/v1/sd-models", timeout=5)
-            if r.ok and isinstance(r.json(), list) and len(r.json()) > 0 and _probe_render():
-                _probe_passed = True  # /health may now answer 200 (liveness permitting)
+            if requests.get(f"{COMFY_URL}/system_stats", timeout=5).ok and _models_visible():
+                _ready = True
                 _append_log(READY_TOKEN)
                 return
         except Exception:
@@ -183,129 +221,199 @@ def _readiness_shim() -> None:
 threading.Thread(target=_readiness_shim, daemon=True).start()
 
 
-# ── benchmark: a real peepy-style render (fixed recipe, random seed) ─────────
-# Prompt pieces mirror api/_lib/chat-core.ts buildForgePayload so the
-# benchmark exercises exactly what production requests will: both LoRA
-# loads, the TI negatives, clip-skip, checkpoint override, and ADetailer.
+# ── the clip graph (benchmark + reference for the app's graph builder) ───────
+# Wan 2.2 I2V A14B: the high-noise half runs the first half of the steps and hands
+# its leftover noise to the low-noise half (KSamplerAdvanced pair). The still is
+# pinned as both first and last frame, so the clip loops; the last frame is dropped
+# because it duplicates frame 0 at the seam.
 
-QUALITY_HEAD = ("masterpiece, best quality, amazing quality, very aesthetic, "
-                "high resolution, ultra-detailed, absurdres, newest")
-ARTIST_TAGS = "(( pnk_crow )), (( domo_(domo_kizusuki) ))"
-LORA_BLOCK = ("Expressiveh <lora:Expressive_H:1> "
-              "<lora:noobaiXLNAIXL_epsilonPred11Version-lora:0.15>")
-MALE_STYLING = ("natural light, light on body, male focus, male only, "
-                "(blush:0.2), smooth skin, large pectorals")
-APPEARANCE = "1boy, solo, adult male, short black hair, athletic build"
-SELFIE_BEAT = ("dynamic angle, looking at viewer, ( blush :0.4), "
-               "light details, light on face, natural light")
-OUTFIT = "casual t-shirt <lora:Undressing_Male:0.3>"
-
-NEGATIVE = ("modern, recent, oldest, cartoon, graphic, text, painting, crayon, "
-            "graphite, abstract, glitch, deformed, mutated, ugly, disfigured, "
-            "long body, lowres, bad anatomy, missing fingers, extra digit, "
-            "fewer digits, cropped, very displeasing, (worst quality, bad "
-            "quality:1.2), sketch, jpeg artifacts, signature, watermark, "
-            "username, chibi, simple background, conjoined, ai-generated, "
-            "female, girl, feminine, AissistXLv2-neg , unaestheticXL_bp5")
-
-AD_FACE_NEGATIVE = ("cartoon, graphic, text, deformed, ugly, disfigured, lowres, "
-                    "bad anatomy, cropped, (worst quality, bad quality:1.2), "
-                    "jpeg artifacts, watermark, female, girl, feminine")
-
-
-def make_benchmark_payload() -> dict:
-    prompt = ", ".join([QUALITY_HEAD, ARTIST_TAGS, LORA_BLOCK, MALE_STYLING,
-                        APPEARANCE, SELFIE_BEAT, OUTFIT])
+def make_clip_graph(image_name: str, prompt: str, width: int = 480, height: int = 704,
+                    frames: int = 49, fps: float = 16.0, steps: int = 4, seed: int = 0) -> dict:
+    split = steps // 2
     return {
-        "prompt": prompt,
-        "negative_prompt": NEGATIVE,
-        "steps": 35,
-        "cfg_scale": 5,
-        "width": 832,
-        "height": 1216,
-        "sampler_name": "Euler a",
-        "seed": random.randint(0, 2**31 - 1),
-        "send_images": True,
-        "save_images": False,
-        "override_settings": {
-            "CLIP_stop_at_last_layers": 2,
-            "sd_model_checkpoint": BENCHMARK_CHECKPOINT,
-            "enable_pnginfo": False,
-        },
-        "override_settings_restore_afterwards": False,
-        "alwayson_scripts": {
-            "ADetailer": {
-                "args": [
-                    True,   # ad_enable
-                    False,  # skip_img2img
-                    {
-                        "ad_model": "face_yolov8n.pt",
-                        "ad_prompt": ", ".join([QUALITY_HEAD, APPEARANCE]),
-                        "ad_negative_prompt": AD_FACE_NEGATIVE,
-                        "ad_confidence": 0.6,
-                        "ad_dilate_erode": 4,
-                        "ad_mask_blur": 4,
-                        "ad_denoising_strength": 0.3,
-                        "ad_inpaint_only_masked": True,
-                        "ad_inpaint_only_masked_padding": 32,
-                    },
-                ],
-            },
-        },
+        "1": {"class_type": "LoadImage", "inputs": {"image": image_name}},
+        "2": {"class_type": "UNETLoader", "inputs": {"unet_name": WAN_HIGH, "weight_dtype": "default"}},
+        "3": {"class_type": "UNETLoader", "inputs": {"unet_name": WAN_LOW, "weight_dtype": "default"}},
+        "4": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["2", 0], "lora_name": LORA_HIGH, "strength_model": 1.0}},
+        "5": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["3", 0], "lora_name": LORA_LOW, "strength_model": 1.0}},
+        "6": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["4", 0], "shift": 5.0}},
+        "7": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["5", 0], "shift": 5.0}},
+        "8": {"class_type": "CLIPLoader", "inputs": {"clip_name": WAN_TE, "type": "wan", "device": "default"}},
+        "9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["8", 0], "text": prompt}},
+        "10": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["8", 0], "text": ""}},
+        "11": {"class_type": "VAELoader", "inputs": {"vae_name": WAN_VAE}},
+        "12": {"class_type": "WanFirstLastFrameToVideo", "inputs": {
+            "positive": ["9", 0], "negative": ["10", 0], "vae": ["11", 0],
+            "width": width, "height": height, "length": frames, "batch_size": 1,
+            "start_image": ["1", 0], "end_image": ["1", 0]}},
+        "13": {"class_type": "KSamplerAdvanced", "inputs": {
+            "model": ["6", 0], "add_noise": "enable", "noise_seed": seed, "steps": steps, "cfg": 1.0,
+            "sampler_name": "euler", "scheduler": "simple",
+            "positive": ["12", 0], "negative": ["12", 1], "latent_image": ["12", 2],
+            "start_at_step": 0, "end_at_step": split, "return_with_leftover_noise": "enable"}},
+        "14": {"class_type": "KSamplerAdvanced", "inputs": {
+            "model": ["7", 0], "add_noise": "disable", "noise_seed": seed, "steps": steps, "cfg": 1.0,
+            "sampler_name": "euler", "scheduler": "simple",
+            "positive": ["12", 0], "negative": ["12", 1], "latent_image": ["13", 0],
+            "start_at_step": split, "end_at_step": 10000, "return_with_leftover_noise": "disable"}},
+        "15": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0], "vae": ["11", 0]}},
+        "16": {"class_type": "ImageFromBatch", "inputs": {"image": ["15", 0], "batch_index": 0, "length": frames - 1}},
+        "17": {"class_type": "CreateVideo", "inputs": {"images": ["16", 0], "fps": fps}},
+        "18": {"class_type": "SaveVideo", "inputs": {
+            "video": ["17", 0], "filename_prefix": "peepy/clip", "format": "mp4",
+            "format.codec": "h264", "format.codec.encoding": "re-encode",
+            "format.codec.encoding.crf": 20.0}},
     }
 
 
-def workload_calculator(payload: dict) -> float:
-    """Request cost in comparable units: steps x megapixels, with multipliers
-    for the hires pass and the ADetailer face pass. A default peepy selfie
-    (35 steps, 832x1216, ADetailer) ~= 49.6 units."""
-    steps = float(payload.get("steps", 35))
-    mp = float(payload.get("width", 832)) * float(payload.get("height", 1216)) / 1e6
-    cost = steps * mp
-    if payload.get("enable_hr"):
-        cost *= 2.5
-    scripts = payload.get("alwayson_scripts") or {}
-    if "ADetailer" in scripts:
-        cost *= 1.4
-    return cost
+def _png(width: int, height: int) -> bytes:
+    """A plain gradient PNG built in pure Python, so the benchmark needs no image library
+    and the public repo ships no picture."""
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        g = int(255 * y / max(1, height - 1))
+        for x in range(width):
+            rows += bytes((int(255 * x / max(1, width - 1)), g, 128))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+            + chunk(b"IEND", b""))
 
 
-# ── live progress passthrough ────────────────────────────────────────────────
-# Forge's /sdapi/v1/progress is GET-only, so a plain forwarding handler can't
-# front it (the pyworker forwards POST). A remote-dispatch handler runs this
-# coroutine instead of forwarding — it answers WHILE a render is in flight
-# because allow_parallel_requests=True bypasses the txt2img FIFO queue, and
-# the caller reuses the render's own auth_data (signatures aren't single-use).
+BENCH_IMAGE = "peepy_bench.png"
+_BENCH_PNG_B64 = base64.b64encode(_png(480, 704)).decode()
 
-async def forge_progress() -> dict:
+
+def make_benchmark_payload() -> dict:
+    return {
+        "prompt": make_clip_graph(BENCH_IMAGE, "a man breathes slowly, subtle natural motion, static camera",
+                                  seed=random.randint(0, 2**31 - 1)),
+        "timeout_s": 900,
+        "images": {BENCH_IMAGE: _BENCH_PNG_B64},
+        # The framework counts any returned value as a passing benchmark run; an
+        # exception is what fails it, so a worker that can't render never goes live.
+        "strict": True,
+    }
+
+
+def clip_workload(payload: dict) -> float:
+    """frames × megapixels × sampler steps, read from the graph. The benchmark measures
+    throughput in these same units, so wait_time = queued workload ÷ throughput comes out
+    in seconds. The default 49-frame 480×704 4-step clip = ~66 units."""
     try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(f"{FORGE_URL}/sdapi/v1/progress",
-                             params={"skip_current_image": "true"}) as r:
-                if r.status == 200:
-                    return await r.json()
+        graph = payload.get("prompt") or {}
+        frames, w, h, steps = 49.0, 480.0, 704.0, 4.0
+        for node in graph.values():
+            ct = node.get("class_type")
+            inp = node.get("inputs") or {}
+            if ct in ("WanFirstLastFrameToVideo", "WanImageToVideo"):
+                frames = float(inp.get("length", frames))
+                w = float(inp.get("width", w))
+                h = float(inp.get("height", h))
+            elif ct in ("KSamplerAdvanced", "KSampler"):
+                steps = float(inp.get("steps", steps))
+        return frames * (w * h / 1e6) * steps
     except Exception:
-        pass
-    return {}
+        return 66.0
 
 
 # ── ComfyUI render (remote-dispatch) ─────────────────────────────────────────
-# The client sends {payload: {prompt: <API-format graph>, timeout_s}} and gets
-# back {result: {images: [b64, ...]}} — the same images-array shape as Forge's
-# txt2img response, so the peepy dispatcher (renderComfy in vast.ts) reuses its
-# parsing. Runs as a remote_function because ComfyUI's API is async (submit →
-# poll /history → fetch /view), not a single POST the forwarder could front.
+# {payload: {prompt: <API graph>, timeout_s, images: {filename: base64}}} →
+# {result: {files: [{filename, mime, animated, b64}], images: [b64 of stills]}} or
+# {result: {error, detail}}.
 
-async def comfy_render(prompt: dict = None, timeout_s: float = 240.0, images: dict = None) -> dict:
+MIME = {".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".webp": "image/webp",
+        ".gif": "image/gif", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+
+
+async def _comfy_post(path: str, body: dict, timeout: float = 15) -> None:
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+            async with s.post(f"{COMFY_URL}{path}", json=body) as r:
+                await r.read()
+    except Exception:
+        pass
+
+
+async def _cancel(pid: str | None) -> None:
+    """Stop a prompt whether it is running or still queued."""
+    if pid:
+        await _comfy_post("/queue", {"delete": [pid]})
+    await _comfy_post("/interrupt", {"prompt_id": pid} if pid else {})
+
+
+async def _get_json(path: str, timeout: float = 10):
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+        async with s.get(f"{COMFY_URL}{path}") as r:
+            return await r.json(content_type=None)
+
+
+async def _drain_orphans(deadline: float) -> None:
+    """The pyworker runs one request at a time, so anything already in ComfyUI's queue
+    when a request starts is left over from a caller that went away. Clear it first."""
+    try:
+        q = await _get_json("/queue")
+    except Exception:
+        return
+    if not (q.get("queue_running") or q.get("queue_pending")):
+        return
+    await _comfy_post("/queue", {"clear": True})
+    await _comfy_post("/interrupt", {})
+    stop = min(deadline, time.time() + 30)
+    while time.time() < stop:
+        await asyncio.sleep(1)
+        try:
+            if not (await _get_json("/queue", 5)).get("queue_running"):
+                return
+        except Exception:
+            pass
+
+
+# Every save node writes under its own peepy/<request id>/ folder. A fresh prefix changes
+# the node's inputs, so ComfyUI's cache can't answer a repeat graph with files this
+# worker already deleted, and the whole folder goes once the bytes are in hand.
+SAVE_NODES = ("SaveVideo", "SaveImage", "SaveAnimatedWEBP", "SaveAnimatedPNG", "SaveWEBM")
+
+
+def _scope_outputs(prompt: dict, tag: str) -> dict:
+    scoped = {}
+    for nid, node in prompt.items():
+        if isinstance(node, dict) and node.get("class_type") in SAVE_NODES:
+            inputs = dict(node.get("inputs") or {})
+            base = os.path.basename(str(inputs.get("filename_prefix") or "").replace("\\", "/")) or "out"
+            inputs["filename_prefix"] = f"peepy/{tag}/{base}"
+            node = {**node, "inputs": inputs}
+        scoped[nid] = node
+    return scoped
+
+
+async def comfy_render(prompt: dict = None, timeout_s: float = 600.0, images: dict = None,
+                       strict: bool = False, **_extra) -> dict:
+    result = await _comfy_render(prompt, timeout_s, images)
+    if strict and "error" in result:
+        raise RuntimeError(f"{result['error']}: {str(result.get('detail', ''))[:300]}")
+    return result
+
+
+async def _comfy_render(prompt: dict, timeout_s: float, images: dict) -> dict:
     if not isinstance(prompt, dict) or not prompt:
         return {"error": "missing prompt graph"}
-    # Perfect Copy references: {filename: base64} written into ComfyUI's input dir
-    # so the graph's LoadImage nodes find them at validation time. basename() kills
-    # path traversal; files are removed after the render either way.
+    if _gpu_fault:
+        return {"error": "gpu fault", "detail": _gpu_fault}
+    try:
+        timeout_s = float(timeout_s)
+    except Exception:
+        timeout_s = 600.0
+    # One budget for the whole request: draining, rendering and fetching.
+    deadline = time.time() + timeout_s
     staged = []
     if isinstance(images, dict):
-        input_dir = "/workspace/ComfyUI/input"
+        input_dir = os.path.join(COMFY_DIR, "input")
         try:
             for name, b64 in images.items():
                 if not isinstance(name, str) or not isinstance(b64, str):
@@ -319,18 +427,32 @@ async def comfy_render(prompt: dict = None, timeout_s: float = 240.0, images: di
                 try: os.remove(p)
                 except Exception: pass
             return {"error": f"comfy image staging failed: {ex}"}
+    tag = uuid.uuid4().hex
+    holder: dict = {}
     try:
-        return await _comfy_render_inner(prompt, timeout_s)
+        await _drain_orphans(deadline)
+        return await _render_inner(_scope_outputs(prompt, tag), timeout_s, deadline, holder)
+    except asyncio.CancelledError:
+        await asyncio.shield(_cancel(holder.get("pid")))
+        raise
     finally:
         for p in staged:
             try: os.remove(p)
             except Exception: pass
+        shutil.rmtree(os.path.join(COMFY_DIR, "output", "peepy", tag), ignore_errors=True)
 
 
-async def _comfy_render_inner(prompt: dict, timeout_s: float) -> dict:
+def _in_queue(q: dict, pid: str) -> bool:
+    for key in ("queue_running", "queue_pending"):
+        for item in q.get(key) or []:
+            if isinstance(item, list) and len(item) > 1 and item[1] == pid:
+                return True
+    return False
+
+
+async def _render_inner(prompt: dict, timeout_s: float, deadline: float, holder: dict) -> dict:
     try:
-        t = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=t) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
             async with s.post(f"{COMFY_URL}/prompt", json={"prompt": prompt}) as r:
                 sub = await r.json(content_type=None)
                 if r.status != 200:
@@ -340,111 +462,95 @@ async def _comfy_render_inner(prompt: dict, timeout_s: float) -> dict:
     pid = sub.get("prompt_id")
     if not pid:
         return {"error": "comfy returned no prompt_id", "detail": sub}
-    deadline = time.time() + float(timeout_s)
+    holder["pid"] = pid
     entry = None
+    missing = 0
     while time.time() < deadline:
         await asyncio.sleep(2)
         try:
-            t = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=t) as s:
-                async with s.get(f"{COMFY_URL}/history/{pid}") as r:
-                    data = await r.json(content_type=None)
+            data = await _get_json(f"/history/{pid}", 15)
         except Exception:
-            continue  # transient poll failure — the render is still running
+            continue
         e = (data or {}).get(pid)
         if not e:
+            # In neither the history nor the queue twice in a row: ComfyUI restarted
+            # (or dropped the prompt) and nothing will ever finish it. Fail now rather
+            # than at the deadline.
+            try:
+                missing = 0 if _in_queue(await _get_json("/queue", 10), pid) else missing + 1
+            except Exception:
+                continue
+            if missing >= 2:
+                return {"error": "comfy lost the prompt (restarted?)"}
             continue
+        missing = 0
         status = e.get("status") or {}
         if status.get("status_str") == "error":
-            # surface the failing node's message, not the whole history blob
             msgs = [m for m in status.get("messages") or [] if m and m[0] == "execution_error"]
-            return {"error": "comfy execution failed", "detail": (msgs[-1][1] if msgs else status)}
+            detail = msgs[-1][1] if msgs else status
+            _note_render_error(detail)
+            return {"error": "comfy execution failed", "detail": detail}
         if status.get("completed"):
             entry = e
             break
     if entry is None:
+        await _cancel(pid)
         return {"error": f"comfy timeout after {timeout_s}s"}
-    images = []
+    files, stills = [], []
     try:
-        t = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(timeout=t) as s:
+        # A finished clip is worth fetching even right at the deadline.
+        fetch_s = max(15.0, deadline - time.time())
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=fetch_s)) as s:
             for out in (entry.get("outputs") or {}).values():
-                for im in out.get("images") or []:
-                    if im.get("type") != "output":
-                        continue
-                    q = {"filename": im.get("filename", ""),
-                         "subfolder": im.get("subfolder", ""), "type": "output"}
-                    async with s.get(f"{COMFY_URL}/view", params=q) as r:
-                        if r.status == 200:
-                            images.append(base64.b64encode(await r.read()).decode())
+                animated = bool((out.get("animated") or [False])[0])
+                for key in ("images", "gifs", "videos"):
+                    for item in out.get(key) or []:
+                        if item.get("type") != "output":
+                            continue
+                        name = item.get("filename", "")
+                        q = {"filename": name, "subfolder": item.get("subfolder", ""), "type": "output"}
+                        async with s.get(f"{COMFY_URL}/view", params=q) as r:
+                            if r.status != 200:
+                                continue
+                            b64 = base64.b64encode(await r.read()).decode()
+                        ext = os.path.splitext(name)[1].lower()
+                        is_anim = animated or key != "images" or ext in (".mp4", ".webm", ".mkv", ".gif")
+                        files.append({"filename": name, "mime": MIME.get(ext, "application/octet-stream"),
+                                      "animated": is_anim, "b64": b64})
+                        if not is_anim:
+                            stills.append(b64)
     except Exception as ex:
-        return {"error": f"comfy image fetch failed: {ex}"}
-    if not images:
-        return {"error": "comfy produced no output images"}
-    return {"images": images}
-
-
-def comfy_workload(payload: dict) -> float:
-    """Same units as workload_calculator (steps × megapixels) read out of the
-    graph's KSampler/EmptyLatentImage nodes, ×2 because Anima's DiT steps run
-    ~2× an SDXL step on the same GPU."""
-    try:
-        graph = payload.get("prompt") or {}
-        steps, w, h = 27.0, 832.0, 1216.0
-        for node in graph.values():
-            ct = node.get("class_type")
-            inp = node.get("inputs") or {}
-            if ct == "KSampler":
-                steps = float(inp.get("steps", steps))
-            elif ct == "EmptyLatentImage":
-                w = float(inp.get("width", w))
-                h = float(inp.get("height", h))
-        return steps * (w * h / 1e6) * 2.0
-    except Exception:
-        return 55.0  # ~an anima render's typical cost
+        return {"error": f"comfy output fetch failed: {ex}"}
+    if not files:
+        return {"error": "comfy produced no output files"}
+    return {"files": files, "images": stills}
 
 
 # ── worker config ────────────────────────────────────────────────────────────
 
 worker_config = WorkerConfig(
     model_server_url="http://127.0.0.1",
-    model_server_port=FORGE_PORT,
+    model_server_port=COMFY_PORT,
     model_log_file=LOG_FILE,
-    # Readiness + liveness gate (see the health block above): the framework polls this every
-    # 10s, needs one 200 before marking the model loaded, and errors the worker on a later
-    # non-200 — a Forge that dies is taken out of routing instead of 500ing every render.
     model_healthcheck_url=f"http://127.0.0.1:{HEALTH_PORT}/health",
     handlers=[
         HandlerConfig(
-            route="/sdapi/v1/txt2img",
-            allow_parallel_requests=False,   # one render at a time per GPU
-            max_queue_time=120.0,
-            workload_calculator=workload_calculator,
+            route="/comfy/render",
+            allow_parallel_requests=False,   # one clip at a time per GPU
+            # A clip runs minutes, so one queued clip already means a long wait; the
+            # app caps clips in flight itself, this only stops a pile-up.
+            max_queue_time=600.0,
+            workload_calculator=clip_workload,
+            remote_function=comfy_render,
             benchmark_config=BenchmarkConfig(
                 generator=make_benchmark_payload,
                 concurrency=1,
-                runs=2,
+                runs=1,          # each run is a full clip (~2 min); the warmup also loads the models
             ),
-        ),
-        HandlerConfig(
-            route="/comfy/render",
-            allow_parallel_requests=False,  # one render at a time on this backend
-            max_queue_time=120.0,
-            workload_calculator=comfy_workload,
-            remote_function=comfy_render,
-        ),
-        HandlerConfig(
-            route="/sdapi/v1/progress",
-            allow_parallel_requests=True,   # must answer during a render
-            max_queue_time=None,            # cosmetic polls never 429
-            workload_calculator=lambda payload: 0.0,  # zero autoscaler load
-            remote_function=forge_progress,
         ),
     ],
     log_action_config=LogActionConfig(
         on_load=[READY_TOKEN],
-        # ONLY our own fatal token — never generic "Traceback": Forge logs
-        # tracebacks for recoverable per-request errors, and on_error is fatal.
         on_error=[FAIL_TOKEN],
         on_info=[],
     ),
