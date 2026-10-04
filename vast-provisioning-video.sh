@@ -45,6 +45,18 @@ VIDEO_MODELS=(
     "loras|minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|$H3_REPO/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|1956192992|"
     "loras|yaoi_h3_lora_000002500.safetensors|https://civitai.com/api/download/models/3234992?fileId=3117398|155110336|F769A344264F620957C24916F376F5C1A83DEFDE45FD43351BECA2ECA0F6E381"
 )
+# Optional extras (Oct 4 2026): LoRAs nothing in the app loads yet, here for testing. Same
+# format and checks, but a worker starts without any of them — a failed fetch only warns,
+# and provisioning_verify doesn't look at them. An EMPTY url = the R2 mirror only
+# (peepy-models/video/loras/): Civitai serves those two to signed-in accounts only.
+#   turbo v1.2 (lightx2v 4-step, 768p) — the newer turbo, to compare with v1.0
+#   2D Anime Style NSFW (v0.4, the 19.5k-step file) — trigger "2d anime style"
+#   Faster! Harder! Shake Harder! (Motion Booster, Anime Edition)
+VIDEO_EXTRAS=(
+    "loras|minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors|https://civitai.com/api/download/models/3297123?fileId=3181960|1956193000|C8168EBC17BBACC4296103DDA2FEC1BA85B24392FA08CF2BFBCEF0CFF0DC3CC8"
+    "loras|NSFW_ANIME_V7_H3-step00019500.safetensors||596450480|C69A8E719B6784A8E475004CD47D34D1DDEFBB5DAA2D7670632CD3B459490B8D"
+    "loras|H3_Motion_Booster_anime.safetensors||155110280|CF23F3F8AC3D663DD3EA49482F90DD4321EFF6A052AD6DFC7518321C01B78B9B"
+)
 
 function provisioning_start() {
     printf "\n##############################################\n#     Peepy VIDEO worker provisioning        #\n##############################################\n\n"
@@ -118,6 +130,10 @@ function fetch_one() {
         fi
         rm -f "$dest"
     fi
+    if [[ -z "$url" ]]; then
+        echo "[provision] $name is not in the R2 mirror (it has no public source)"
+        return 1
+    fi
     # The Hugging Face token (optional) goes to Hugging Face only, never to Civitai.
     local auth=()
     [[ -n "$HF_TOKEN" && "$url" == "$HF/"* ]] && auth=(--header="Authorization: Bearer $HF_TOKEN")
@@ -165,6 +181,14 @@ function provisioning_get_models() {
         echo "[provision] FATAL: model download failed"
         exit 1
     fi
+    # the optional extras, after the required set (never fatal)
+    pids=()
+    for entry in "${VIDEO_EXTRAS[@]}"; do
+        IFS='|' read -r dir name url size sha <<< "$entry"
+        ( fetch_one "$dir" "$name" "$url" "$size" "$sha"             || echo "[provision] WARN: optional $name not fetched — the worker runs without it" ) &
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p"; done
 }
 
 # ── Supervisor service ───────────────────────────────────────────────────────
