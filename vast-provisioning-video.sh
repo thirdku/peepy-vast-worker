@@ -18,7 +18,7 @@
 # text_encoders/, vae/…): every image worker syncs those at boot.
 #
 # Template env: PYWORKER_REPO=https://github.com/thirdku/peepy-vast-worker,
-# PYWORKER_REF=video, and optionally the R2 rclone block + R2_BUCKET, HF_TOKEN.
+# PYWORKER_REF=video, and optionally the R2 rclone block + R2_BUCKET, HF_TOKEN, CIVITAI_TOKEN.
 # ─────────────────────────────────────────────────────────────────────────────
 
 source /venv/main/bin/activate 2>/dev/null || true
@@ -45,17 +45,20 @@ VIDEO_MODELS=(
     "loras|minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|$H3_REPO/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|1956192992|"
     "loras|yaoi_h3_lora_000002500.safetensors|https://civitai.com/api/download/models/3234992?fileId=3117398|155110336|F769A344264F620957C24916F376F5C1A83DEFDE45FD43351BECA2ECA0F6E381"
 )
-# Optional extras (Oct 4 2026): LoRAs nothing in the app loads yet, here for testing. Same
-# format and checks, but a worker starts without any of them — a failed fetch only warns,
-# and provisioning_verify doesn't look at them. An EMPTY url = the R2 mirror only
-# (peepy-models/video/loras/): Civitai serves those two to signed-in accounts only.
+# Optional extras (Oct 4 2026). Same format and checks, but a worker starts without any of
+# them — a failed fetch only warns, and provisioning_verify doesn't look at them. The app's
+# clip graph loads the anime LoRA (0.6) and the Motion Booster (0.4) on every clip since the
+# motion builder; worker.py drops either from the graph when it isn't on disk, so a clip still
+# renders (without that look). Civitai serves those two to signed-in accounts only: they come
+# from the R2 mirror (peepy-models/video/loras/) or, with CIVITAI_TOKEN in the template env, from
+# Civitai itself (the token goes to civitai.com only).
 #   turbo v1.2 (lightx2v 4-step, 768p) — the newer turbo, to compare with v1.0
 #   2D Anime Style NSFW (v0.4, the 19.5k-step file) — trigger "2d anime style"
 #   Faster! Harder! Shake Harder! (Motion Booster, Anime Edition)
 VIDEO_EXTRAS=(
     "loras|minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors|https://civitai.com/api/download/models/3297123?fileId=3181960|1956193000|C8168EBC17BBACC4296103DDA2FEC1BA85B24392FA08CF2BFBCEF0CFF0DC3CC8"
-    "loras|NSFW_ANIME_V7_H3-step00019500.safetensors||596450480|C69A8E719B6784A8E475004CD47D34D1DDEFBB5DAA2D7670632CD3B459490B8D"
-    "loras|H3_Motion_Booster_anime.safetensors||155110280|CF23F3F8AC3D663DD3EA49482F90DD4321EFF6A052AD6DFC7518321C01B78B9B"
+    "loras|NSFW_ANIME_V7_H3-step00019500.safetensors|https://civitai.com/api/download/models/3286171?fileId=3170500|596450480|C69A8E719B6784A8E475004CD47D34D1DDEFBB5DAA2D7670632CD3B459490B8D"
+    "loras|H3_Motion_Booster_anime.safetensors|https://civitai.com/api/download/models/3299686?fileId=3184584|155110280|CF23F3F8AC3D663DD3EA49482F90DD4321EFF6A052AD6DFC7518321C01B78B9B"
 )
 
 function provisioning_start() {
@@ -112,6 +115,24 @@ function file_ok() {
     [[ "$(sha256sum "$f" | cut -d' ' -f1)" == "${sha,,}" ]]
 }
 
+# A Civitai token (optional, template env CIVITAI_TOKEN) unlocks the sign-in-only files. wget
+# would resend an Authorization header to every redirect hop, so the token is used here only to
+# walk the civitai.com redirects (curl, no follow); the signed delivery URL that comes back is
+# fetched without it. Any other URL — or no token — passes through unchanged.
+function civitai_src() {
+    local u="$1" next i
+    if [[ -z "$CIVITAI_TOKEN" || "$u" != "https://civitai.com/"* ]]; then
+        echo "$u"; return
+    fi
+    for i in 1 2 3 4; do
+        [[ "$u" == "https://civitai.com/"* ]] || break
+        next=$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 60 -A "Mozilla/5.0" -H "Authorization: Bearer $CIVITAI_TOKEN" "$u")
+        [[ -n "$next" ]] || break
+        u="$next"
+    done
+    echo "$u"
+}
+
 function fetch_one() {
     local dir="$1" name="$2" url="$3" size="$4" sha="$5"
     local dest="$COMFY_DIR/models/$dir/$name"
@@ -147,7 +168,7 @@ function fetch_one() {
         if [[ -f "$dest.part" ]] && (( $(stat -c %s "$dest.part") > size )); then
             rm -f "$dest.part"
         fi
-        wget -c -q --read-timeout=120 --user-agent="Mozilla/5.0" "${auth[@]}" -O "$dest.part" "$url"
+        wget -c -q --read-timeout=120 --user-agent="Mozilla/5.0" "${auth[@]}" -O "$dest.part" "$(civitai_src "$url")"
         if file_ok "$dest.part" "$size" "$sha"; then
             mv "$dest.part" "$dest"
             echo "[provision] $name downloaded"

@@ -428,6 +428,51 @@ async def _drain_orphans(deadline: float) -> None:
             pass
 
 
+# LoRAs the app's graph may name that a fresh worker can lack (Oct 4 2026): the two Civitai files
+# behind a sign-in (VIDEO_EXTRAS in vast-provisioning-video.sh — fetched only from the R2 mirror or
+# with CIVITAI_TOKEN) and the newer turbo. A graph naming one that isn't on disk renders WITHOUT it
+# (its consumers re-wired to its input model) instead of failing ComfyUI's validation. The required
+# models (REQUIRED_MODELS) are never dropped — a worker without them never reports ready.
+OPTIONAL_LORAS = {
+    "NSFW_ANIME_V7_H3-step00019500.safetensors",
+    "H3_Motion_Booster_anime.safetensors",
+    "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+}
+
+
+def _drop_missing_loras(prompt: dict) -> dict:
+    lora_dir = os.path.join(COMFY_DIR, "models", "loras")
+    drop = {}
+    for nid, node in prompt.items():
+        if not (isinstance(node, dict) and node.get("class_type") == "LoraLoaderModelOnly"):
+            continue
+        inputs = node.get("inputs") or {}
+        name = inputs.get("lora_name")
+        if name in OPTIONAL_LORAS and not os.path.isfile(os.path.join(lora_dir, name)):
+            drop[str(nid)] = inputs.get("model")
+    if not drop:
+        return prompt
+
+    def resolve(ref):
+        for _ in range(len(drop) + 1):  # a chain of dropped loaders resolves to the first kept input
+            if isinstance(ref, list) and len(ref) == 2 and str(ref[0]) in drop and ref[1] == 0:
+                ref = drop[str(ref[0])]
+            else:
+                break
+        return ref
+
+    out = {}
+    for nid, node in prompt.items():
+        if str(nid) in drop:
+            continue
+        if isinstance(node, dict):
+            node = {**node, "inputs": {k: resolve(v) for k, v in (node.get("inputs") or {}).items()}}
+        out[nid] = node
+    names = sorted(str((prompt[n].get("inputs") or {}).get("lora_name")) for n in drop)
+    print(f"[video] optional LoRA(s) not on this worker, rendering without: {', '.join(names)}", flush=True)
+    return out
+
+
 # Every save node writes under its own peepy/<request id>/ folder. A fresh prefix changes
 # the node's inputs, so ComfyUI's cache can't answer a repeat graph with files this
 # worker already deleted, and the whole folder goes once the bytes are in hand.
@@ -485,7 +530,7 @@ async def _comfy_render(prompt: dict, timeout_s: float, images: dict) -> dict:
     holder: dict = {}
     try:
         await _drain_orphans(deadline)
-        return await _render_inner(_scope_outputs(prompt, tag), timeout_s, deadline, holder)
+        return await _render_inner(_scope_outputs(_drop_missing_loras(prompt), tag), timeout_s, deadline, holder)
     except asyncio.CancelledError:
         await asyncio.shield(_cancel(holder.get("pid")))
         raise
