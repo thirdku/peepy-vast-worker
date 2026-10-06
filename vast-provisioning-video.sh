@@ -55,10 +55,14 @@ VIDEO_MODELS=(
 #   turbo v1.2 (lightx2v 4-step, 768p) — the newer turbo, to compare with v1.0
 #   2D Anime Style NSFW (v0.4, the 19.5k-step file) — trigger "2d anime style"
 #   Faster! Harder! Shake Harder! (Motion Booster, Anime Edition)
+#   Epic Cumshots (H3 ALPHA) + HMCumshot (v0.1) — the app adds both when a clip's action (or a
+#   section of a split clip) is Cum (Oct 6 2026; clip-graph.ts MOTION_LORAS), same fallback
 VIDEO_EXTRAS=(
     "loras|minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors|https://civitai.com/api/download/models/3297123?fileId=3181960|1956193000|C8168EBC17BBACC4296103DDA2FEC1BA85B24392FA08CF2BFBCEF0CFF0DC3CC8"
     "loras|NSFW_ANIME_V7_H3-step00019500.safetensors|https://civitai.com/api/download/models/3286171?fileId=3170500|596450480|C69A8E719B6784A8E475004CD47D34D1DDEFBB5DAA2D7670632CD3B459490B8D"
     "loras|H3_Motion_Booster_anime.safetensors|https://civitai.com/api/download/models/3299686?fileId=3184584|155110280|CF23F3F8AC3D663DD3EA49482F90DD4321EFF6A052AD6DFC7518321C01B78B9B"
+    "loras|epic_cumshots-MiniMaxH3-ALPHA-CUMSH0T.safetensors|https://civitai.com/api/download/models/3202064?fileId=3083352|155110392|9D8D1C90AD8C875FD4FBEBCBB0D189E77E874C2C2A64077EA6D1937DEE27C100"
+    "loras|HMCumshot_v1_e120.safetensors|https://civitai.com/api/download/models/3227331?fileId=3109563|626294968|87376EAB88511C76DE00BF591D3565ADE1AAE4E5C9D6811A85DB0668467C6A71"
 )
 
 function provisioning_start() {

@@ -437,6 +437,9 @@ OPTIONAL_LORAS = {
     "NSFW_ANIME_V7_H3-step00019500.safetensors",
     "H3_Motion_Booster_anime.safetensors",
     "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+    # the Cum action's two LoRAs (Oct 6 2026) — the same Civitai sign-in, the same fallback
+    "epic_cumshots-MiniMaxH3-ALPHA-CUMSH0T.safetensors",
+    "HMCumshot_v1_e120.safetensors",
 }
 
 
