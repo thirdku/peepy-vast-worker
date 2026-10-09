@@ -67,6 +67,23 @@ VIDEO_EXTRAS=(
     "loras|H3_Motion_Booster_anime.safetensors|https://civitai.com/api/download/models/3299686?fileId=3184584|155110280|CF23F3F8AC3D663DD3EA49482F90DD4321EFF6A052AD6DFC7518321C01B78B9B"
     "loras|epic_cumshots-MiniMaxH3-ALPHA-CUMSH0T.safetensors|https://civitai.com/api/download/models/3202064?fileId=3083352|155110392|9D8D1C90AD8C875FD4FBEBCBB0D189E77E874C2C2A64077EA6D1937DEE27C100"
     "loras|HMCumshot_v1_e120.safetensors|https://civitai.com/api/download/models/3227331?fileId=3109563|626294968|87376EAB88511C76DE00BF591D3565ADE1AAE4E5C9D6811A85DB0668467C6A71"
+    # ── LTX 2.3 (Sulphur 2), the app's second engine (admin-only trial, Oct 7 2026; clip-graph.ts
+    # buildLtxClipGraph). Hand-copied onto the first worker, so the Oct 8 replacement had none of
+    # it and every LTX clip failed. Optional: a worker without them still serves H3; LTX clips
+    # fail + refund until they land. ~45 GB. Hugging Face files pinned by revision + sha256.
+    "checkpoints|sulphur_dev_fp8mixed.safetensors|$HF/SulphurAI/Sulphur-2-base/resolve/65587bbb38c700622f9434a16e732c8b280c115e/sulphur_dev_fp8mixed.safetensors|29161842846|41c999575859c528ff108022246a5524960a778c18742696971c9b0aadb4f70f"
+    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|$HF/Comfy-Org/ltx-2/resolve/ccde4ba417d7900669fd56dd292a883cee11ff37/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors|9447702218|aaca463d11e6d8d2a4bdb0d6299214c15ef78a3f73e0ef8113d5a9d0219b3f6d"
+    "loras|ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors|$HF/SulphurAI/Sulphur-2-base/resolve/65587bbb38c700622f9434a16e732c8b280c115e/distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors|662072824|e970f64a2ce5469491fb1714a3fa72c8b606fa82affff0531e836dbc91d31f34"
+    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|$HF/Lightricks/LTX-2.3/resolve/3c6a4e66e5d0a684231950b9c74dd4ded7b6fadc/ltx-2.3-spatial-upscaler-x2-1.1.safetensors|995743560|5f416311fa8172b65af67530758964708d29a317b830d689a51143b7f91913ed"
+    # 2D NSFW Motion Enhancer (1.0, every explicit LTX clip) and creampie (not wired yet) — Hugging
+    # Face mirrors of the Civitai files (same sha256), saved under the names the app's graph uses
+    "loras|LTX23_2d_nsfw_motion_enhancer.safetensors|$HF/Muapi/ltx-2.3-2d-nsfw-motion-enhancer/resolve/17dd5bf5845ced4a24da52bfcda39e226f5462ae/ltx-2.3-2d-nsfw-motion-enhancer.safetensors|1348027400|a7a13202745900078d7b53edf8975c93fcb1f7815f53f97ae338dea077173cfc"
+    "loras|LTX23_creampie_cum_animation_early.safetensors|$HF/Muapi/ltx-2.3-i2v-creampie-cum-animation-early/resolve/ffdd7ade77038e209457e8b6b9ecddf7864d5446/ltx-2.3-i2v-creampie-cum-animation-early.safetensors|674249632|33f611042ec5529d4042693653f53aa7e286517697677866f94d1858848110db"
+    # Civitai-only (sign-in): Better NSFW motion v2 (0.7) · VBVR reasoning v4 (0.5) · DR34ML4Y v2
+    # (0.3) — mirrored in R2 peepy-models/video/loras/ (Oct 9 2026), else CIVITAI_TOKEN
+    "loras|Sulphur_LTX 2.3_better _NSFW_motion.safetensors|https://civitai.com/api/download/models/2986751?fileId=2866267|654446000|A0ED4CD01CF0AC88CF324A4FC432D02ABE18F0A0CB9DFB45F04A26A08AA31987"
+    "loras|LTX2.3_reasoning_Sulphur-2_I2V_V4.safetensors|https://civitai.com/api/download/models/3025398?fileId=2904187|805412760|1F7C87052D44087E17630B7075D8DFD8205C17CE5E7D3BCBEAE11AF2102C88DB"
+    "loras|DR34ML4Y_LTXXX_V2.safetensors|https://civitai.com/api/download/models/2950842?fileId=2830123|1940553800|D91D2E783879601BC7A638C978F8257E5ED340C012E7D668B7CD32DE443FF2E1"
 )
 
 function provisioning_start() {
