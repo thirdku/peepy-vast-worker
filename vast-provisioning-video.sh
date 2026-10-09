@@ -42,6 +42,10 @@ VIDEO_MODELS=(
     "diffusion_models|minimax_h3_fl2va_pruned_int8_convrot.safetensors|$H3_REPO/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors|20970379616|"
     "text_encoders|qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|$H3_REPO/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|15687142551|"
     "vae|minimax_h3_video_vae_int8_convrot.safetensors|$H3_REPO/vae/minimax_h3_video_vae_int8_convrot.safetensors|2811065184|"
+    # The audio VAE: every clip with a Sound pick decodes its track with it (VAEDecodeAudio).
+    # It was copied onto the first worker by hand (Oct 4 2026) and missing from this list, so
+    # every replacement worker failed all clips with sound ("value_not_in_list") — Oct 8 2026.
+    "vae|minimax_h3_audio_vae_fp32.safetensors|$H3_REPO/vae/minimax_h3_audio_vae_fp32.safetensors|605254808|"
     "loras|minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|$H3_REPO/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors|1956192992|"
     "loras|yaoi_h3_lora_000002500.safetensors|https://civitai.com/api/download/models/3234992?fileId=3117398|155110336|F769A344264F620957C24916F376F5C1A83DEFDE45FD43351BECA2ECA0F6E381"
 )
