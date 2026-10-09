@@ -193,12 +193,24 @@ _mode = None
 _forge_loaded = False   # Forge holds a checkpoint in VRAM
 
 
+# Photos first (owner, Oct 9 2026): a photo takes seconds, a clip minutes, so a clip waits
+# behind the photos — but one that has waited CLIP_MAX_WAIT_S goes before any photo that
+# hasn't started, so a steady stream of photos can't starve it. A photo that would wait
+# longer than PHOTO_MAX_WAIT_S (a long clip rendering) is turned away at once: the app then
+# sends it to the photo pool. Estimates are the workloads (3090 GPU-seconds) × HYBRID_SPEED.
+CLIP_MAX_WAIT_S = float(os.environ.get("HYBRID_CLIP_MAX_WAIT_S", "120"))
+PHOTO_MAX_WAIT_S = float(os.environ.get("HYBRID_PHOTO_MAX_WAIT_S", "45"))
+HYBRID_SPEED = float(os.environ.get("HYBRID_SPEED", "0.75"))
+
+
 class GpuGate:
-    """One job at a time; a waiting clip goes before any waiting photo."""
+    """One job at a time; photos first, a clip that has waited CLIP_MAX_WAIT_S next."""
 
     def __init__(self) -> None:
         self._busy = False
-        self._videos_waiting = 0
+        self._cur = None      # (started_at, est_s) of the running job
+        self._photos = []     # waiting photos: [arrived_at, est_s], in arrival order
+        self._clips = []      # waiting clips: [arrived_at, est_s], in arrival order
         self._cond = None
 
     def _c(self) -> asyncio.Condition:
@@ -206,22 +218,49 @@ class GpuGate:
             self._cond = asyncio.Condition()
         return self._cond
 
-    async def acquire(self, video: bool) -> None:
+    def photo_wait(self) -> float:
+        """Seconds a photo arriving now would wait before it starts."""
+        now = time.time()
+        w = 0.0
+        if self._busy and self._cur:
+            w += max(2.0, self._cur[1] - (now - self._cur[0]))
+        w += sum(e[1] for e in self._photos)
+        for arrived, est in self._clips:   # a clip that is overdue by then goes first
+            if now + w - arrived >= CLIP_MAX_WAIT_S:
+                w += est
+        return w
+
+    async def acquire(self, video: bool, est: float) -> None:
         c = self._c()
         async with c:
-            if video:
-                self._videos_waiting += 1
-            try:
-                await c.wait_for(lambda: not self._busy and (video or self._videos_waiting == 0))
-            finally:
+            entry = [time.time(), est]
+            line = self._clips if video else self._photos
+            line.append(entry)
+
+            def my_turn() -> bool:
+                if self._busy:
+                    return False
+                overdue = bool(self._clips) and time.time() - self._clips[0][0] >= CLIP_MAX_WAIT_S
                 if video:
-                    self._videos_waiting -= 1
+                    return self._clips[0] is entry and (not self._photos or overdue)
+                return self._photos[0] is entry and not overdue
+
+            try:
+                while not my_turn():
+                    try:   # wake on release, and every second for the clip's clock
+                        await asyncio.wait_for(c.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                line.remove(entry)
             self._busy = True
+            self._cur = (time.time(), est)
 
     async def release(self) -> None:
         c = self._c()
         async with c:
             self._busy = False
+            self._cur = None
             c.notify_all()
 
 
@@ -625,8 +664,14 @@ def _scope_outputs(prompt: dict, tag: str) -> dict:
 async def comfy_render(prompt: dict = None, timeout_s: float = 600.0, images: dict = None,
                        strict: bool = False, **_extra) -> dict:
     video = _is_video(prompt)
+    est = clip_workload({"prompt": prompt}) * HYBRID_SPEED
+    if not video:
+        wait = _gate.photo_wait()
+        if wait > PHOTO_MAX_WAIT_S:
+            _log(f"comfy photo turned away: {wait:.0f}s wait")
+            return {"error": "busy", "wait_s": round(wait)}
     t_wait = time.time()
-    await _gate.acquire(video)
+    await _gate.acquire(video, est)
     waited = time.time() - t_wait
     t0 = time.time()
     try:
@@ -770,8 +815,12 @@ async def forge_txt2img(**body) -> dict:
         return {"error": "forge not ready"}
     if _gpu_fault:
         return {"error": "gpu fault", "detail": _gpu_fault}
+    wait = _gate.photo_wait()
+    if wait > PHOTO_MAX_WAIT_S:
+        _log(f"forge photo turned away: {wait:.0f}s wait")
+        return {"error": "busy", "wait_s": round(wait)}
     t_wait = time.time()
-    await _gate.acquire(False)
+    await _gate.acquire(False, forge_workload(body) * HYBRID_SPEED)
     waited = time.time() - t_wait
     t0 = time.time()
     try:
@@ -818,9 +867,11 @@ worker_config = WorkerConfig(
     model_log_file=LOG_FILE,
     model_healthcheck_url=f"http://127.0.0.1:{HEALTH_PORT}/health",
     handlers=[
+        # Both GPU routes are "parallel" to the framework: its own line is one FIFO for every
+        # route, so the GpuGate above does the ordering (photos first) and the turning away.
         HandlerConfig(
             route="/comfy/render",
-            allow_parallel_requests=False,
+            allow_parallel_requests=True,
             max_queue_time=600.0,
             workload_calculator=clip_workload,
             remote_function=comfy_render,
@@ -832,8 +883,8 @@ worker_config = WorkerConfig(
         ),
         HandlerConfig(
             route="/forge/txt2img",
-            allow_parallel_requests=False,
-            max_queue_time=120.0,
+            allow_parallel_requests=True,
+            max_queue_time=None,
             workload_calculator=forge_workload,
             remote_function=forge_txt2img,
         ),
