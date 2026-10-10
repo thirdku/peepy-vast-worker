@@ -473,6 +473,75 @@ function provisioning_install_comfyui() {
     done
     "$COMFY_VENV/bin/pip" cache purge >/dev/null 2>&1 || true
 
+    # peepy: the Full clip's upscale node (peepy-chatai clip-graph.ts → PeepyUpscaleFrames, Oct 11 2026).
+    # H3 renders Full on its own 768-short-edge canvas and RealESRGAN_x4plus_anime_6B (Forge's hires
+    # model, read through extra_model_paths' upscale_models) brings the frames to the photo's size, a few
+    # at a time — ComfyUI's ImageUpscaleWithModel holds the whole clip at 4x (~19 GB of RAM).
+    cat > "$COMFY_DIR/custom_nodes/peepy_upscale_frames.py" <<'PEEPYUP'
+# peepy: upscale a clip's frames with an upscale model a few at a time and resize each chunk to
+# the target size on the GPU straight away, so only the finished frames are ever held. ComfyUI's
+# ImageUpscaleWithModel keeps the whole batch at the model's 4x size (a 5 s H3 clip at 768x1024 =
+# 124 x 3072 x 4096 floats, ~19 GB of RAM, and the cache keeps it after the run).
+import torch
+import torch.nn.functional as F
+
+import comfy.model_management as mm
+import comfy.utils
+
+
+class PeepyUpscaleFrames:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "upscale_model": ("UPSCALE_MODEL",),
+            "images": ("IMAGE",),
+            "width": ("INT", {"default": 1024, "min": 32, "max": 4096, "step": 2}),
+            "height": ("INT", {"default": 1360, "min": 32, "max": 4096, "step": 2}),
+            "chunk": ("INT", {"default": 4, "min": 1, "max": 64}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = "image/upscaling"
+
+    def run(self, upscale_model, images, width, height, chunk):
+        device = upscale_model.patcher.load_device
+        scale = max(float(upscale_model.scale), 1.0)
+        n, h, w, _ = images.shape
+        # the model's working set for one tile (ImageUpscaleWithModel's estimate per 512 tile, scaled to
+        # this tile) + one chunk at the model's scale; an OOM still halves the tile below
+        tile = 1024
+        need = (tile * tile * 3) * 4 * scale * 384.0 + chunk * 3 * int(h * scale) * int(w * scale) * 4 * 2
+        mm.load_models_gpu([upscale_model.patcher], memory_required=need, force_full_load=True)
+        out = torch.empty((n, height, width, 3), dtype=mm.intermediate_dtype(), device=mm.intermediate_device())
+        pbar = comfy.utils.ProgressBar(n)
+        # half precision (Real-ESRGAN's own inference default) and whole-frame tiles: a 768x1024 frame
+        # is one pass instead of six overlapping 512 tiles
+        half = device.type == "cuda"
+        for i in range(0, n, chunk):
+            x = images[i:i + chunk, ..., :3].movedim(-1, 1).to(device)
+            while True:
+                try:
+                    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=half):
+                        y = comfy.utils.tiled_scale(x, lambda a: upscale_model(a.float()), tile_x=tile, tile_y=tile,
+                                                    overlap=32, upscale_amount=scale, output_device=device)
+                    break
+                except Exception as e:
+                    mm.raise_non_oom(e)
+                    tile //= 2
+                    if tile < 128:
+                        raise
+            y = F.interpolate(y.clamp(0, 1), size=(height, width), mode="bicubic", antialias=True)
+            out[i:i + chunk] = y.clamp(0, 1).movedim(1, -1).to(out.device, out.dtype)
+            pbar.update(x.shape[0])
+            del x, y
+        return (out,)
+
+
+NODE_CLASS_MAPPINGS = {"PeepyUpscaleFrames": PeepyUpscaleFrames}
+NODE_DISPLAY_NAME_MAPPINGS = {"PeepyUpscaleFrames": "Upscale Frames to Size (peepy)"}
+PEEPYUP
+
     # comfyui-prompt-control fixup: upstream's Anima Attention Couple predates
     # ComfyUI's Jul 17 2026 Cosmos attn2_patch calling convention (pe= kwarg +
     # dict return) — the SDXL-style kv-inject patches crash if they run inside
@@ -687,6 +756,7 @@ function provisioning_verify_image() {
     [[ -f "${COMFY_DIR}/main.py" ]] || { echo "[provision] FATAL: ComfyUI missing"; ok=0; }
     "${COMFY_VENV}/bin/python" -c "import torch, aiohttp" 2>/dev/null || { echo "[provision] FATAL: comfy venv broken"; ok=0; }
     local nd
+    [[ -f "${COMFY_DIR}/custom_nodes/peepy_upscale_frames.py" ]] || { echo "[provision] FATAL: peepy_upscale_frames node missing"; ok=0; }
     for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning comfyui-prompt-control; do
         [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
     done
