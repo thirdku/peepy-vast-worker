@@ -642,6 +642,26 @@ PEEPYNODES
         curl -fsSL -o "$pn/rife49.pth" "$u" || true
     done
 
+    # /video's "Face detailer" (peepy-chatai clip-graph.ts, Oct 11 2026): Carasibana/ComfyUI-H3-FaceRefine
+    # (MIT) re-renders the clip's face crop with H3 and stitches it back. Cloned at a pin and NOT through
+    # COMFY_NODES, whose loop installs requirements.txt: ultralytics + scipy are already in the venv, and
+    # its insightface / scenedetect only serve features the clip graph doesn't use (identity tracking,
+    # cut detection). Its detector = deepghs/anime_face_detection face_detect_v1.4_s (MIT), in ComfyUI's
+    # own ultralytics bbox folder (Impact-Subpack registers it). H3_FACEREFINE_STRICT_PATHS (the service
+    # below) keeps the pack's video-preview routes inside ComfyUI's folder.
+    local frd="$COMFY_DIR/custom_nodes/ComfyUI-H3-FaceRefine"
+    [[ -d "$frd" ]] || git clone -q https://github.com/Carasibana/ComfyUI-H3-FaceRefine "$frd" \
+        || echo "[provision] WARN: ComfyUI-H3-FaceRefine clone failed"
+    git -C "$frd" checkout --quiet d8521d14fe0d721d80cd9417fff5a559cbc21aba \
+        || echo "[provision] WARN: ComfyUI-H3-FaceRefine pin FAILED"
+    local afd="$COMFY_DIR/models/ultralytics/bbox/anime_face_v1.4_s.pt"
+    local afd_sha="13e0d8356e62fecb5a5796f5b1db3aaee3beb2c17dd41a6aadcb6ffe2f63b6b8"
+    mkdir -p "$(dirname "$afd")"
+    if ! echo "$afd_sha  $afd" | sha256sum -c --status 2>/dev/null; then
+        curl -fsSL -o "$afd" "https://huggingface.co/deepghs/anime_face_detection/resolve/main/face_detect_v1.4_s/model.pt" \
+            || echo "[provision] WARN: anime face detector download failed"
+    fi
+
     # comfyui-prompt-control fixup: upstream's Anima Attention Couple predates
     # ComfyUI's Jul 17 2026 Cosmos attn2_patch calling convention (pe= kwarg +
     # dict return) — the SDXL-style kv-inject patches crash if they run inside
@@ -718,7 +738,7 @@ EOF
 function provisioning_install_comfy_service() {
     cat > /etc/supervisor/conf.d/comfyui.conf <<COMFYC
 [program:comfyui]
-environment=PROC_NAME="%(program_name)s"
+environment=PROC_NAME="%(program_name)s",H3_FACEREFINE_STRICT_PATHS="1"
 command=${COMFY_VENV}/bin/python ${COMFY_DIR}/main.py --listen 127.0.0.1 --port ${COMFY_PORT} --disable-auto-launch --disable-metadata
 directory=${COMFY_DIR}
 autostart=true
@@ -863,6 +883,9 @@ function provisioning_verify_image() {
         || { echo "[provision] FATAL: peepy_nodes/rife_arch.py missing or changed"; ok=0; }
     echo "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife49.pth" | sha256sum -c --status \
         || { echo "[provision] FATAL: peepy_nodes/rife49.pth missing or changed"; ok=0; }
+    [[ -f "${COMFY_DIR}/custom_nodes/ComfyUI-H3-FaceRefine/nodes.py" ]] || { echo "[provision] FATAL: ComfyUI-H3-FaceRefine missing"; ok=0; }
+    echo "13e0d8356e62fecb5a5796f5b1db3aaee3beb2c17dd41a6aadcb6ffe2f63b6b8  ${COMFY_DIR}/models/ultralytics/bbox/anime_face_v1.4_s.pt" | sha256sum -c --status \
+        || { echo "[provision] FATAL: anime face detector (anime_face_v1.4_s.pt) missing or changed"; ok=0; }
     for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning comfyui-prompt-control; do
         [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
     done
