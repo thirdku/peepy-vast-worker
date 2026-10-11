@@ -610,6 +610,7 @@ OPTIONAL_LORAS = {
     "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
     "epic_cumshots-MiniMaxH3-ALPHA-CUMSH0T.safetensors",
     "HMCumshot_v1_e120.safetensors",
+    "minimax_h3_oral_mshandjob_rank32_720_90f_000004230.safetensors",
 }
 
 
