@@ -133,6 +133,8 @@ VIDEO_MODELS=(
 #   Gay Motion Pack "Oral + Handjob 720²" (Civitai version 3347868, Early Access — bought on the
 #   owner's account) — the app adds it to Blowjob (trigger "blowjob") and Handjob ("handjob") at 0.8
 #   (Oct 11 2026; clip-graph.ts MOTION_LORAS), same fallback
+#   Gay Motion Pack "Anal 960²" (Civitai version 3347893, Early Access — bought on the owner's
+#   account; trigger "gayanal", 0.75–1.0) — on the worker for testing, not used by the app yet
 VIDEO_EXTRAS=(
     "loras|minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors|https://civitai.com/api/download/models/3297123?fileId=3181960|1956193000|C8168EBC17BBACC4296103DDA2FEC1BA85B24392FA08CF2BFBCEF0CFF0DC3CC8"
     "loras|NSFW_ANIME_V7_H3-step00019500.safetensors|https://civitai.com/api/download/models/3286171?fileId=3170500|596450480|C69A8E719B6784A8E475004CD47D34D1DDEFBB5DAA2D7670632CD3B459490B8D"
@@ -140,6 +142,7 @@ VIDEO_EXTRAS=(
     "loras|epic_cumshots-MiniMaxH3-ALPHA-CUMSH0T.safetensors|https://civitai.com/api/download/models/3202064?fileId=3083352|155110392|9D8D1C90AD8C875FD4FBEBCBB0D189E77E874C2C2A64077EA6D1937DEE27C100"
     "loras|HMCumshot_v1_e120.safetensors|https://civitai.com/api/download/models/3227331?fileId=3109563|626294968|87376EAB88511C76DE00BF591D3565ADE1AAE4E5C9D6811A85DB0668467C6A71"
     "loras|minimax_h3_oral_mshandjob_rank32_720_90f_000004230.safetensors|https://civitai.com/api/download/models/3347868|310168408|C57EDB2ADD7E0CA9654B3C6427011E9F92814C6C22A2AAD995A54CC993AD49BF"
+    "loras|use-anal-v2c_minimaxh3_3336372_epoch_10.safetensors|https://civitai.com/api/download/models/3347893|310170064|ADDD905169CC2D972686C61239EA59478E86EA7B754FD423DCFC0709790576BA"
     # ── LTX 2.3 (Sulphur 2), the app's second engine (admin-only trial, Oct 7 2026; clip-graph.ts
     # buildLtxClipGraph). Hand-copied onto the first worker, so the Oct 8 replacement had none of
     # it and every LTX clip failed. Optional: a worker without them still serves H3; LTX clips
