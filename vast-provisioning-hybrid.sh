@@ -473,20 +473,103 @@ function provisioning_install_comfyui() {
     done
     "$COMFY_VENV/bin/pip" cache purge >/dev/null 2>&1 || true
 
-    # peepy: the Full clip's upscale node (peepy-chatai clip-graph.ts → PeepyUpscaleFrames, Oct 11 2026).
-    # H3 renders Full on its own 768-short-edge canvas and RealESRGAN_x4plus_anime_6B (Forge's hires
-    # model, read through extra_model_paths' upscale_models) brings the frames to the photo's size, a few
-    # at a time — ComfyUI's ImageUpscaleWithModel holds the whole clip at 4x (~19 GB of RAM).
-    cat > "$COMFY_DIR/custom_nodes/peepy_upscale_frames.py" <<'PEEPYUP'
-# peepy: upscale a clip's frames with an upscale model a few at a time and resize each chunk to
-# the target size on the GPU straight away, so only the finished frames are ever held. ComfyUI's
-# ImageUpscaleWithModel keeps the whole batch at the model's 4x size (a 5 s H3 clip at 768x1024 =
-# 124 x 3072 x 4096 floats, ~19 GB of RAM, and the cache keeps it after the run).
+    # peepy's own ComfyUI nodes (peepy-chatai clip-graph.ts, Oct 11 2026): PeepyDeTwos redraws the frames
+    # H3 holds "on twos" with RIFE 4.9 (every H3 clip), PeepyUpscaleFrames is Full's upscale step.
+    # rife_arch.py = Fannovel16/ComfyUI-Frame-Interpolation's RIFE (MIT) at a pinned commit; the pack
+    # itself isn't installed (it loads a dozen other models and wants opencv-contrib-python).
+    local pn="$COMFY_DIR/custom_nodes/peepy_nodes"
+    mkdir -p "$pn"
+    rm -f "$COMFY_DIR/custom_nodes/peepy_upscale_frames.py"
+    cat > "$pn/__init__.py" <<'PEEPYNODES'
+# peepy's own ComfyUI nodes for the hybrid worker (peepy-chatai api/_lib/clip-graph.ts builds the graphs).
+#
+# PeepyDeTwos       — H3 often animates anime "on twos": every drawing held for two frames, so the clip
+#                     moves still / jump / still / jump. This finds the held frames and redraws each one
+#                     with RIFE between the nearest real frames, at its own moment in time. Same frame
+#                     count, same timing, the sound untouched. rife_arch.py = Fannovel16/ComfyUI-Frame-
+#                     Interpolation's RIFE (MIT), fetched by the provisioning at a pinned commit;
+#                     rife49.pth = RIFE 4.9 (sha256 e55fd00f…d533).
+# PeepyUpscaleFrames — upscale a clip's frames with an upscale model a few at a time and resize each
+#                     chunk to the target size on the GPU at once (ImageUpscaleWithModel holds the whole
+#                     clip at the model's 4x size: ~19 GB of RAM for a 5 s clip).
+import os
+
 import torch
 import torch.nn.functional as F
 
 import comfy.model_management as mm
 import comfy.utils
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RIFE_WEIGHTS = os.path.join(HERE, "rife49.pth")
+RIFE_ARCH = "4.7"  # rife49.pth's architecture (the pack's CKPT_NAME_VER_DICT)
+_rife = {}
+
+
+def _rife_model(device):
+    m = _rife.get(str(device))
+    if m is None:
+        from .rife_arch import IFNet
+        m = IFNet(arch_ver=RIFE_ARCH)
+        sd = torch.load(RIFE_WEIGHTS, map_location="cpu", weights_only=True)
+        m.load_state_dict(sd)
+        m = m.eval().to(device)
+        _rife.clear()
+        _rife[str(device)] = m
+    return m
+
+
+def held_frames(images):
+    """Frames that barely changed from the one before while motion resumes within the next two steps
+    (a long real pause stays). Measured against a typical MOVING step (the 75th percentile): half the
+    steps of an on-twos clip are tiny, so the median would hide them."""
+    n = images.shape[0]
+    if n < 4:
+        return []
+    g = images[:, ::4, ::4, :3].float().mean(-1) * 255.0
+    d = (g[1:] - g[:-1]).abs().mean(dim=(1, 2)).tolist()  # d[i] = change from frame i to i+1
+    p75 = float(torch.quantile(torch.tensor(d), 0.75))
+    if p75 < 0.5:  # a still clip
+        return []
+    return [i for i in range(1, n - 1)
+            if d[i - 1] < 0.3 * p75 and (d[i] > 0.6 * p75 or (i + 1 < len(d) and d[i + 1] > 0.6 * p75))]
+
+
+class PeepyDeTwos:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",)}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = "image/animation"
+
+    def run(self, images):
+        held = held_frames(images)
+        n = images.shape[0]
+        if not held:
+            print(f"[peepy] de-twos: no held frames in {n}")
+            return (images,)
+        hs = set(held)
+        keep = [i for i in range(n) if i not in hs]
+        # each held frame k between real frames a and b is drawn at t = (k - a) / (b - a)
+        tasks = [(a, b, (k - a) / (b - a), k) for a, b in zip(keep, keep[1:]) for k in range(a + 1, b)]
+        device = mm.get_torch_device()
+        h, w = images.shape[1], images.shape[2]
+        mm.free_memory(4 * 3 * h * w * 4 * 40 + (512 << 20), device)  # a 4-frame batch's working set
+        model = _rife_model(device)
+        out = images.clone()
+        with torch.inference_mode():
+            for j in range(0, len(tasks), 4):
+                batch = tasks[j:j + 4]
+                i0 = torch.stack([images[a, ..., :3] for a, _, _, _ in batch]).permute(0, 3, 1, 2).to(device, torch.float32)
+                i1 = torch.stack([images[b, ..., :3] for _, b, _, _ in batch]).permute(0, 3, 1, 2).to(device, torch.float32)
+                ts = torch.tensor([t for _, _, t, _ in batch], device=device, dtype=torch.float32).view(-1, 1, 1, 1)
+                mid = model(i0, i1, ts, [8, 4, 2, 1], True, True, False).clamp(0, 1)
+                for (_, _, _, k), m in zip(batch, mid):
+                    out[k, ..., :3] = m.permute(1, 2, 0).to(out.device, out.dtype)
+        print(f"[peepy] de-twos: {len(held)} of {n} frames redrawn")
+        return (out,)
 
 
 class PeepyUpscaleFrames:
@@ -538,9 +621,23 @@ class PeepyUpscaleFrames:
         return (out,)
 
 
-NODE_CLASS_MAPPINGS = {"PeepyUpscaleFrames": PeepyUpscaleFrames}
-NODE_DISPLAY_NAME_MAPPINGS = {"PeepyUpscaleFrames": "Upscale Frames to Size (peepy)"}
-PEEPYUP
+NODE_CLASS_MAPPINGS = {"PeepyDeTwos": PeepyDeTwos, "PeepyUpscaleFrames": PeepyUpscaleFrames}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "PeepyDeTwos": "De-twos: redraw held frames (peepy, RIFE)",
+    "PeepyUpscaleFrames": "Upscale Frames to Size (peepy)",
+}
+PEEPYNODES
+    local rife_arch_url="https://raw.githubusercontent.com/Fannovel16/ComfyUI-Frame-Interpolation/26545cc2dd95bc3d27f056016300673bdeee78f5/vfi_models/rife/rife_arch.py"
+    local rife_arch_sha="1bdd8bc4e5147c5ba075e2c9c37dcd0058c4ef093913dbddb6ed5d33bf99789d"
+    local rife_sha="e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533"
+    if ! echo "$rife_arch_sha  $pn/rife_arch.py" | sha256sum -c --status 2>/dev/null; then
+        curl -fsSL -o "$pn/rife_arch.py" "$rife_arch_url" || echo "[provision] WARN: rife_arch.py download failed"
+    fi
+    local u
+    for u in https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/rife49.pth              https://huggingface.co/marduk191/rife/resolve/main/rife49.pth              https://huggingface.co/MachineDelusions/RIFE/resolve/main/rife49.pth; do
+        echo "$rife_sha  $pn/rife49.pth" | sha256sum -c --status 2>/dev/null && break
+        curl -fsSL -o "$pn/rife49.pth" "$u" || true
+    done
 
     # comfyui-prompt-control fixup: upstream's Anima Attention Couple predates
     # ComfyUI's Jul 17 2026 Cosmos attn2_patch calling convention (pe= kwarg +
@@ -756,7 +853,9 @@ function provisioning_verify_image() {
     [[ -f "${COMFY_DIR}/main.py" ]] || { echo "[provision] FATAL: ComfyUI missing"; ok=0; }
     "${COMFY_VENV}/bin/python" -c "import torch, aiohttp" 2>/dev/null || { echo "[provision] FATAL: comfy venv broken"; ok=0; }
     local nd
-    [[ -f "${COMFY_DIR}/custom_nodes/peepy_upscale_frames.py" ]] || { echo "[provision] FATAL: peepy_upscale_frames node missing"; ok=0; }
+    [[ -f "${COMFY_DIR}/custom_nodes/peepy_nodes/__init__.py" ]] || { echo "[provision] FATAL: peepy_nodes missing"; ok=0; }
+    echo "1bdd8bc4e5147c5ba075e2c9c37dcd0058c4ef093913dbddb6ed5d33bf99789d  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife_arch.py" | sha256sum -c --status \n        || { echo "[provision] FATAL: peepy_nodes/rife_arch.py missing or changed"; ok=0; }
+    echo "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife49.pth" | sha256sum -c --status \n        || { echo "[provision] FATAL: peepy_nodes/rife49.pth missing or changed"; ok=0; }
     for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning comfyui-prompt-control; do
         [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
     done
