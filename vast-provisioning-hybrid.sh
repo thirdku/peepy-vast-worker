@@ -47,6 +47,9 @@ ADETAILER_MODELS=(
 # Neo scans models/ESRGAN only; filename becomes the API upscaler name.
 ESRGAN_MODELS=(
     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+    # H3 Full clips' upscaler (peepy-chatai clip-graph.ts UPSCALE_MODEL, Oct 11 2026; ComfyUI reads
+    # this folder as upscale_models) — sha256 b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
 )
 
 # Anima stack fallbacks — public sources, fetched only when the R2 mirror didn't
@@ -843,6 +846,8 @@ function provisioning_verify_image() {
     [[ -f "${NEO_DIR}/models/text_encoder/qwen_3_06b_base.safetensors" ]] || { echo "[provision] FATAL: qwen text encoder missing"; ok=0; }
     [[ -f "${NEO_DIR}/models/VAE/qwen_image_vae.safetensors" ]] || { echo "[provision] FATAL: qwen VAE missing"; ok=0; }
     [[ -f "${NEO_DIR}/models/ESRGAN/RealESRGAN_x4plus_anime_6B.pth" ]] || { echo "[provision] FATAL: hires upscaler missing"; ok=0; }
+    echo "b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d  ${NEO_DIR}/models/ESRGAN/realesr-animevideov3.pth" | sha256sum -c --status \
+        || { echo "[provision] FATAL: Full clips' upscaler (realesr-animevideov3.pth) missing or changed"; ok=0; }
     [[ -f "${NEO_DIR}/models/adetailer/face_yolov8n.pt" ]] || { echo "[provision] FATAL: adetailer face model missing"; ok=0; }
     [[ -d "${NEO_DIR}/extensions/ADetailer-Neo" ]] || { echo "[provision] FATAL: ADetailer-Neo missing"; ok=0; }
     [[ -d "${NEO_DIR}/extensions/sd-forge-couple" ]] || { echo "[provision] FATAL: sd-forge-couple missing"; ok=0; }
@@ -854,8 +859,10 @@ function provisioning_verify_image() {
     "${COMFY_VENV}/bin/python" -c "import torch, aiohttp" 2>/dev/null || { echo "[provision] FATAL: comfy venv broken"; ok=0; }
     local nd
     [[ -f "${COMFY_DIR}/custom_nodes/peepy_nodes/__init__.py" ]] || { echo "[provision] FATAL: peepy_nodes missing"; ok=0; }
-    echo "1bdd8bc4e5147c5ba075e2c9c37dcd0058c4ef093913dbddb6ed5d33bf99789d  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife_arch.py" | sha256sum -c --status \n        || { echo "[provision] FATAL: peepy_nodes/rife_arch.py missing or changed"; ok=0; }
-    echo "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife49.pth" | sha256sum -c --status \n        || { echo "[provision] FATAL: peepy_nodes/rife49.pth missing or changed"; ok=0; }
+    echo "1bdd8bc4e5147c5ba075e2c9c37dcd0058c4ef093913dbddb6ed5d33bf99789d  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife_arch.py" | sha256sum -c --status \
+        || { echo "[provision] FATAL: peepy_nodes/rife_arch.py missing or changed"; ok=0; }
+    echo "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533  ${COMFY_DIR}/custom_nodes/peepy_nodes/rife49.pth" | sha256sum -c --status \
+        || { echo "[provision] FATAL: peepy_nodes/rife49.pth missing or changed"; ok=0; }
     for nd in ANIMA_BOOSTER anima-artist-mixer ComfyUI-Impact-Pack ComfyUI-Impact-Subpack RES4LYF comfyui_controlnet_aux ComfyUI-Anima-LLLite Comfyui-Anima-Regional-Conditioning comfyui-prompt-control; do
         [[ -d "${COMFY_DIR}/custom_nodes/${nd}" ]] || { echo "[provision] FATAL: ComfyUI node pack ${nd} missing"; ok=0; }
     done
